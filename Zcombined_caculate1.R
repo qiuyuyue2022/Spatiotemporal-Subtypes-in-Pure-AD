@@ -1,0 +1,166 @@
+library(readxl)
+library(dplyr)
+library(writexl)
+library(tidyr)
+
+# 读取数据
+df <- read_excel("D:/Works/ohmymymy/vMRI/sustaln_biomarker/vMRI_biomarker_Zcombined.xlsx")
+df <- read_excel("C:/Users/24717/OneDrive/桌面/扔进sustain.xlsx")
+mean_data <- read_xlsx("D:/Works/ohmymymy/vMRI/vMRI/年龄段均值.xlsx")
+# 将均数据转换为长格式，方便后续匹配
+mean_long <- mean_data %>%
+  pivot_longer(cols = -1, names_to = "Brain_Region", values_to = "Mean") %>%
+  rename(Age_Group = 1)  # 将第一列重命名为 Age_Group
+
+# 定义函数：加权Zcombined
+weighted_zcombined <- function(df, regions, suffix = "_Z", mean_long) {
+  z_scores <- df %>% select(paste0(regions, suffix))
+  age_groups <- df$Age_Group
+  
+  weights_matrix <- matrix(NA, nrow = nrow(df), ncol = length(regions))
+  
+  for (i in seq_along(regions)) {
+    region <- regions[i]
+    # 针对每个患者，找到该年龄组 + 区域对应的标准均值
+    weights_matrix[, i] <- sapply(seq_along(age_groups), function(j) {
+      weight <- mean_long %>%
+        filter(Age_Group == age_groups[j], Brain_Region == region) %>%
+        pull(Mean)
+      if (length(weight) == 0) NA else weight
+    })
+  }
+  
+  sum_weights <- rowSums(weights_matrix, na.rm = TRUE)
+  z_scores_mat <- as.matrix(z_scores)
+  weighted_z <- rowSums(weights_matrix * z_scores_mat, na.rm = TRUE)
+  
+  return(weighted_z / sum_weights)
+}
+
+
+# 开始计算各个指标
+df <- df %>%
+  mutate(
+    CC_Zcombined = weighted_zcombined(df, c("CC_Anterior_pct", "CC_Mid_Anterior_pct", "CC_Central_pct", "CC_Mid_Posterior_pct", "CC_Posterior_pct"), mean_long = mean_long),
+    PCC_Zcombined_L = weighted_zcombined(df, c("Cingulum_Post_L_pct", "Isthmus_of_cingulate_L_pct"), mean_long = mean_long),
+    PCC_Zcombined_R = weighted_zcombined(df, c("Cingulum_Post_R_pct", "Isthmus_of_cingulate_R_pct"), mean_long = mean_long),
+    
+    BG_Zcombined_L = weighted_zcombined(df, c("Caudate_L_pct", "Pallidum_L_pct", "Putamen_L_pct", "Thalamus_L_pct", "Accumbens_Area_L_pct"), mean_long = mean_long),
+    BG_Zcombined_R = weighted_zcombined(df, c("Caudate_R_pct", "Pallidum_R_pct", "Putamen_R_pct", "Thalamus_R_pct", "Accumbens_Area_R_pct"), mean_long = mean_long),
+    
+    Temp_Neo_Zcombined_L = weighted_zcombined(df, c("Temporal_Sup_L_pct", "Temporal_Sup_Banks_L_pct", "Temporal_Mid_L_pct", "Temporal_Inf_L_pct", "Transverse_temporal_L_pct", "Fusiform_L_pct", "Temporal_Pole_L_pct"), mean_long = mean_long),
+    Temp_Neo_Zcombined_R = weighted_zcombined(df, c("Temporal_Sup_R_pct", "Temporal_Sup_Banks_R_pct", "Temporal_Mid_R_pct", "Temporal_Inf_R_pct", "Transverse_temporal_R_pct", "Fusiform_R_pct", "Temporal_Pole_R_pct"), mean_long = mean_long),
+    
+    OFC_Zcombined_L = weighted_zcombined(df, c("Orbitofrontal_Lat_L_pct", "Orbitofrontal_Med_L_pct"), mean_long = mean_long),
+    OFC_Zcombined_R = weighted_zcombined(df, c("Orbitofrontal_Lat_R_pct", "Orbitofrontal_Med_R_pct"), mean_long = mean_long),
+    PFC_Zcombined_L = weighted_zcombined(df, c("Frontal_Sup_L_pct", "Frontal_Mid_Rostral_L_pct", "Frontal_Mid_Caudal_L_pct", "Pars_opercularis_L_pct", "Pars_orbitalis_L_pct", "Pars_triangularis_L_pct", "Frontal_pole_L_pct"), mean_long = mean_long),
+    PFC_Zcombined_R = weighted_zcombined(df, c("Frontal_Sup_R_pct", "Frontal_Mid_Rostral_R_pct", "Frontal_Mid_Caudal_R_pct", "Pars_opercularis_R_pct", "Pars_orbitalis_R_pct", "Pars_triangularis_R_pct", "Frontal_pole_R_pct"), mean_long = mean_long),
+    
+    IPL_Zcombined_L = weighted_zcombined(df, c("Parietal_Inf_L_pct", "Supramarginal_L_pct"), mean_long = mean_long),
+    IPL_Zcombined_R = weighted_zcombined(df, c("Parietal_Inf_R_pct", "Supramarginal_R_pct"), mean_long = mean_long),
+    
+    Med_Occi_Zcombined_L = weighted_zcombined(df, c("Cuneus_L_pct", "Lingual_L_pct", "Peri_calcarine_L_pct"), mean_long = mean_long),
+    Med_Occi_Zcombined_R = weighted_zcombined(df, c("Cuneus_R_pct", "Lingual_R_pct", "Peri_calcarine_R_pct"), mean_long = mean_long)
+  )
+
+# 计算新列
+df <- df %>%
+  mutate(
+    Amygdala_Zcombined = (Amygdala_L_pct_Z + Amygdala_R_pct_Z) / 2,
+    BG_Zcombined = (BG_Zcombined_L + BG_Zcombined_R) / 2,
+    ChP_Zcombined = (Choroid_Plexus_L_pct_Z + Choroid_Plexus_R_pct_Z) / 2,
+    Lat_Occi_Zcombined = (Occipital_Lat_L_pct_Z + Occipital_Lat_R_pct_Z) / 2,
+    Med_Occi_Zcombined = (Med_Occi_Zcombined_L + Med_Occi_Zcombined_R) / 2,
+    OFC_Zcombined = (OFC_Zcombined_L + OFC_Zcombined_R) / 2,
+    SPL_Zcombined = (Parietal_Sup_L_pct_Z + Parietal_Sup_R_pct_Z) / 2,
+    IPL_Zcombined = (IPL_Zcombined_L + IPL_Zcombined_R) / 2,
+    PFC_Zcombined = (PFC_Zcombined_L + PFC_Zcombined_R) / 2,
+    PCC_Zcombined = (PCC_Zcombined_L + PCC_Zcombined_R) / 2,
+    Precuneus_Zcombined = (Precuneus_L_pct_Z + Precuneus_R_pct_Z) / 2,
+    Temp_Neo_Zcombined = (Temp_Neo_Zcombined_L + Temp_Neo_Zcombined_R) / 2,
+    Insula_Zcombined = (Insula_L_pct_Z + Insula_R_pct_Z) / 2,
+    Hippo_Zcombined = (Hippocampus_L_pct_Z + Hippocampus_R_pct_Z) / 2,
+    Parahippo_Zcombined = (Parahippocampal_L_pct_Z + Parahippocampal_R_pct_Z) / 2,
+    Entorhinal_Zcombined = (Entorhinal_L_pct_Z + Entorhinal_R_pct_Z) / 2,
+  )
+
+library(readxl)
+library(ggplot2)
+zcombined_cols <- grep("_Zcombined$", names(df), value = TRUE)
+length(zcombined_cols)
+print(zcombined_cols)
+# 顺序重排
+zcombined_cols <- c(
+  "Amygdala_Zcombined", "Hippo_Zcombined", "Parahippo_Zcombined", "Entorhinal_Zcombined", 
+  "Temp_Neo_Zcombined",
+  "PCC_Zcombined","SPL_Zcombined","IPL_Zcombined", "Precuneus_Zcombined", 
+  "OFC_Zcombined", "PFC_Zcombined", 
+  "Lat_Occi_Zcombined", "Med_Occi_Zcombined", 
+  "Insula_Zcombined", 
+  "BG_Zcombined", "CC_Zcombined", 
+  "ChP_Zcombined"
+)
+
+# 获取数据框中其余列（非 Zcombined 列）
+non_zcombined_cols <- setdiff(names(df), zcombined_cols)
+
+# 重新排序：非 Zcombined 列 + 按解剖顺序排序的 Zcombined 列
+df <- df[, c(non_zcombined_cols, zcombined_cols)]
+nrow(df)
+# 可选择保存新表
+library(openxlsx)
+write.xlsx(df, "C:/Users/24717/OneDrive/桌面/扔进sustain_Zcombined.xlsx")
+
+
+# 逐列检查每个 _Zcombined 变量的最小值、最大值和NA个数
+summary_stats <- sapply(df[zcombined_cols], function(x) {
+  c(min = min(x, na.rm = TRUE),
+    max = max(x, na.rm = TRUE),
+    mean = mean(x, na.rm = TRUE),
+    sd = sd(x, na.rm = TRUE),
+    NAs = sum(is.na(x)))
+})
+# 转置结果以便查看
+summary_stats <- t(summary_stats)
+# 打印结果
+print(summary_stats)
+
+# 将数据转长格式，便于 ggplot 画图
+library(tidyr)
+library(dplyr)
+df_long <- df %>%
+  select(all_of(zcombined_cols)) %>%
+  pivot_longer(cols = everything(), names_to = "region", values_to = "value")
+# 画出密度图
+ggplot(df_long, aes(x = value)) +
+  geom_density(fill = "steelblue", alpha = 0.5) +
+  facet_wrap(~ region, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribution of _Zcombined Variables", x = "Z value", y = "Density")
+
+
+
+# 筛查异常值
+outliers_list <- list()
+# 遍历每一列，检查 Z 值是否超过阈值（绝对值 > 5）
+for (col in zcombined_cols) {
+  outlier_rows <- which(abs(df[[col]]) > 5 & !is.na(df[[col]]))  # 非NA且|Z|>3
+  if (length(outlier_rows) > 0) {
+    outliers_list[[col]] <- data.frame(
+      Row = outlier_rows,
+      Value = df[[col]][outlier_rows]
+    )
+  }
+}
+# 打印异常值结果
+if (length(outliers_list) == 0) {
+  cat("没有发现异常值。\n")
+} else {
+  for (col in names(outliers_list)) {
+    cat("异常值列:", col, "\n")
+    print(outliers_list[[col]])
+    cat("\n")
+  }
+}
+
+
