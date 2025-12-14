@@ -1,0 +1,260 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# 数据准备
+```{r}
+library(dplyr)
+library(readr)
+library(FSA)        # Dunn test
+library(rstatix)    # tidy 问法的统计
+options(scipen = 999)
+
+# 读入数据
+df <- read_csv("/Users/qiuyuyue/Documents/MRI/data/SuStaIn/原sustain_result_FINAL_MERGED.csv")
+
+# 确保 ml_subtype 是 factor
+df$ml_subtype <- factor(df$ml_subtype, levels = c(1,2,3,4))
+
+# 需要比较的 biomarkers
+biomarkers <- c("lumi_Ab42", "lumi_pTau181", "lumi_tTau",
+                "lumi_Ab42_40", "lumi_pTau_42", "lumi_tTau_42",
+                "ptau217")
+```
+
+
+# KW
+```{r}
+kw_results <- df %>%
+  dplyr::select(ml_subtype, all_of(biomarkers)) %>%
+  pivot_longer(cols = biomarkers, names_to = "biomarker", values_to = "value") %>%
+  group_by(biomarker) %>%
+  summarise(
+    p = kruskal.test(value ~ ml_subtype)$p.value
+  ) %>%
+  mutate(
+    p_adj = p.adjust(p, method = "BH")   # FDR(BH) 校正
+  )
+
+print(kw_results)
+
+```
+
+# Dunn
+```{r}
+sig_biomarkers <- c("lumi_Ab42", "lumi_tTau_42", "ptau217")
+
+dunn_results <- df %>%
+  dplyr::select(ml_subtype, all_of(sig_biomarkers)) %>%
+  pivot_longer(cols = sig_biomarkers, names_to = "biomarker", values_to = "value") %>%
+  group_by(biomarker) %>%
+  do(
+    FSA::dunnTest(value ~ ml_subtype, data = ., method = "bh")$res
+  ) %>%
+  add_significance("P.adj")
+
+print(dunn_results)
+colSums(is.na(df[, sig_biomarkers]))
+
+```
+
+# 可视化
+
+```{r}
+library(ggpubr)
+library(tidyverse)
+library(rstatix)
+
+# 1. 数据准备
+plot_data <- df %>%
+  dplyr::select(ml_subtype, all_of(sig_biomarkers)) %>%
+  pivot_longer(cols = all_of(sig_biomarkers), names_to = "biomarker", values_to = "value") %>%
+  mutate(ml_subtype = as.factor(ml_subtype)) %>%
+  drop_na()
+
+# 2. 核心修改：使用 group_modify 针对每个 biomarker 单独计算位置
+# 这样能保证每个图的横线高度是根据它自己的数据范围来定的
+stat.test <- plot_data %>%
+  group_by(biomarker) %>%
+  group_modify(~ {
+    .x %>%
+      wilcox_test(value ~ ml_subtype) %>%
+      adjust_pvalue(method = "BH") %>%
+      add_significance() %>%
+      filter(p.adj < 0.05) %>%
+      # 这里的 step.increase 现在只针对当前的 biomarker 生效
+      add_xy_position(x = "ml_subtype", step.increase = 0.05) 
+  }) %>%
+  ungroup() # 记得解组
+
+# 3. 绘图
+ggboxplot(plot_data, x = "ml_subtype", y = "value",
+          fill = "ml_subtype", palette = "jama",
+          add = "jitter",
+          facet.by = "biomarker", scales = "free_y",
+          short.panel.labs = FALSE,
+          outlier.shape = NA) + # 隐藏自带离群点，避免视觉混乱
+  
+  # 绘制显著性标记
+  stat_pvalue_manual(stat.test, label = "p.adj.signif", 
+                     tip.length = 0.01, 
+                     hide.ns = TRUE) +
+  
+  # 调整 Y 轴留白：顶部留 15% 空间给星号，底部留 5%
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  
+  theme_bw() +
+  labs(x = "ML Subtype", y = "Biomarker Level")
+
+```
+
+
+
+# 直方图
+```{r}
+library(tidyverse)
+
+df_long <- df %>%
+  dplyr::select(all_of(biomarkers)) %>%
+  pivot_longer(cols = biomarkers, names_to = "biomarker", values_to = "value")
+
+p <- ggplot(df_long, aes(x = value)) +
+  # 直方图
+  geom_histogram(aes(y = ..density..), bins = 30, fill = "grey80", color = "white") +
+  # 平滑密度曲线
+  geom_density(color = "red", size = 1) +
+  facet_wrap(~ biomarker, scales = "free") +
+  theme_bw() +
+  labs(title = "Biomarker Distributions (Histogram + Density Curve)",
+       x = "Value",
+       y = "Density")
+
+p
+
+
+```
+# boxcox
+```{r}
+library(tidyverse)
+library(MASS)      # 包含 boxcox 函数
+library(ggpubr)
+library(rstatix)
+
+df_boxcox <- df %>% dplyr::select(ml_subtype, all_of(biomarkers))
+
+# 创建一个列表来存储转换后的数据
+transformed_list <- list()
+cat("\n--- Box-Cox 转换参数 (Lambda) ---\n")
+
+# 2. 循环处理每个 biomarker
+for (var in biomarkers) {
+  
+  # 提取原始数据
+  original_values <- df_boxcox[[var]]
+  
+  # --- 修复点 1: 检查负值时忽略 NA (na.rm = TRUE) ---
+  if (any(original_values <= 0, na.rm = TRUE)) {
+    # 计算偏移量 (同样要忽略 NA)
+    shift <- abs(min(original_values, na.rm = TRUE)) + 0.001
+    original_values <- original_values + shift
+  }
+  
+  # --- 修复点 2: boxcox 函数计算 lambda 时不能有 NA ---
+  # 我们创建一个临时的干净数据只用来算 lambda
+  clean_values_for_lambda <- na.omit(original_values)
+  
+  # A. 计算最佳 Lambda
+  bc <- boxcox(clean_values_for_lambda ~ 1, plotit = FALSE, lambda = seq(-2, 2, by = 0.1))
+  lambda <- bc$x[which.max(bc$y)]
+  
+  cat(sprintf("Biomarker: %-15s | 最佳 Lambda: %.3f\n", var, lambda))
+  
+  # B. 应用转换公式 (对包含 NA 的原始数据应用，这样 NA 还是 NA，行数保持不变)
+  if (abs(lambda) < 0.001) {
+    trans_values <- log(original_values)
+  } else {
+    trans_values <- (original_values^lambda - 1) / lambda
+  }
+  
+  # C. 存入列表
+  transformed_list[[var]] <- trans_values
+}
+
+
+# 3. 整理转换后的数据用于可视化
+df_trans_long <- as.tibble(transformed_list) %>%
+  mutate(ml_subtype = df_boxcox$ml_subtype) %>% # 把分组加回来
+  pivot_longer(cols = all_of(biomarkers), names_to = "biomarker", values_to = "boxcox_value")
+
+# 4. 可视化检查：Q-Q 图 (Overall)
+ggqqplot(df_trans_long, x = "boxcox_value", 
+         facet.by = "biomarker", 
+         scales = "free",
+         title = "Box-Cox Transformed Data Normality Check") +
+  theme_bw()
+
+# 5. 数值检查：Shapiro-Wilk 检验
+cat("\n--- Shapiro-Wilk Test (Box-Cox Transformed) ---\n")
+df_trans_long %>%
+  group_by(biomarker) %>%
+  shapiro_test(boxcox_value) %>%
+  print()
+
+
+```
+
+# 好了，现在呢看起来好像正态了，进行年龄+ml_stage校正的组间比较
+```{r}
+library(tidyverse)
+library(emmeans)
+library(car) # 用于 Anova() 函数
+
+# 1. 整合数据：将 Box-Cox 转换后的数据与原始的 Age 和 ml_subtype 合并
+# 注意：这里假设 transformed_list 的顺序与 df 的行顺序是一致的（如果您没对 df 乱序，通常是一致的）
+df_final <- df %>%
+  dplyr::select(ml_subtype, age, ml_stage) %>%
+  bind_cols(as_tibble(transformed_list))
+
+# 2. 循环进行 ANCOVA (协方差分析)
+cat("\n====== ANCOVA 结果 (已校正 age, 使用 Box-Cox 数据) ======\n")
+for (var in biomarkers) {
+  cat(sprintf("\n>>> 当前分析变量: %s <<<\n", var))
+  # A. 构建线性模型: 转换后的Biomarker ~ 分组 + 年龄
+  # 这里的 var 是 transformed_list 中的列名
+  f <- as.formula(paste(var, "~ ml_subtype + age + ml_stage"))
+  model <- lm(f, data = df_final)
+  
+  # B. 总体显著性检验 (Type II ANOVA)
+  # 这一步看 ml_subtype 作为一个整体是否显著
+  anova_res <- car::Anova(model, type = 2)
+  print(anova_res)
+  
+  # C. 组间两两比较 (Post-hoc)
+  # 仅当 ANOVA 显示 ml_subtype 显著 (p<0.05) 时，才建议看具体的组间差异
+  if (anova_res["ml_subtype", "Pr(>F)"] < 0.05) {
+    cat("\n  [Post-hoc] 组间两两比较 (FDR 校正):\n")
+    
+    # 计算边际均值 (Estimated Marginal Means) 并进行成对比较
+    emm_res <- emmeans(model, pairwise ~ ml_subtype, adjust = "fdr")
+    
+    # 提取并打印显著的对比结果
+    emm_contrasts <- as.data.frame(emm_res$contrasts) %>%
+      filter(p.value < 0.05)
+    
+    if (nrow(emm_contrasts) > 0) {
+      print(emm_contrasts)
+    } else {
+      cat("  (虽然总体显著，但 FDR 校正后未发现两两显著差异)\n")
+    }
+    
+  } else {
+    cat("\n  [提示] ml_subtype 总体效应不显著，无需进行两两比较。\n")
+  }
+  
+  cat("----------------------------------------------------------\n")
+}
+```
+
+
+

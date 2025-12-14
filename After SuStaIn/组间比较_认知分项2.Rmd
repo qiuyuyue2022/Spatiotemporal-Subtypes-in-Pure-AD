@@ -1,0 +1,601 @@
+---
+title: "组间比较_认知分项"
+output: html_notebook
+---
+
+```{r}
+rm(list = ls())
+library(readxl)
+library(writexl)
+library(dplyr)
+library(readxl)
+library(ggpubr)
+library(car)
+library(ggplot2)
+library(psych)
+library(rstatix)
+library(naniar)
+library(clinfun)
+library(tidyr)
+library(purrr)
+library(stats)
+
+
+options(scipen = 999)
+original_path <- "/Users/qiuyuyue/Documents/MRI/data/SuStaIn/pureAD_最终版2_MCMC100000/vMRI_with_SuStaIn_S3to5_with_WMH_APOE_multiCOG.xlsx"
+df <- read_excel(original_path)
+df$ml_subtype <- df$SuStaIn_S4_subtype + 1
+df$ml_stage <- df$SuStaIn_S4_stage
+```
+
+
+### Stage & MMSE
+```{r}
+cor.test(df$ml_stage, df$closet_MMSE, method = "spearman", use = "complete.obs")
+df$ml_stage <- as.numeric(as.character(df$ml_stage))
+jonckheere.test(df$closet_MMSE, df$ml_stage, alternative = "decreasing")
+
+ggplot(df, aes(x = factor(ml_stage), y = closet_MMSE)) +
+  geom_boxplot(fill = "skyblue") +
+  labs(x = "SuStaIn Stage", y = "MMSE") +
+  theme_minimal() +
+  scale_x_discrete(breaks = as.character(seq(0, 50, by = 5))) +
+  annotate("text", 
+           x = 47, y = 31.5, 
+           label = paste0("Spearman rho = -0.56, p < 0.0001\nJonckheere p < 0.0001"), 
+           hjust = 1, vjust = 1.2, size = 3.5)
+sum(complete.cases(df$ml_stage, df$closet_MMSE))
+```
+
+
+### 数据预处理
+```{r}
+df$ml_subtype <- as.factor(df$ml_subtype)
+
+df <- df %>%
+  mutate(moca_attention_calculation = moca_attention + moca_calculation) %>%
+  select(-moca_attention, -moca_calculation)
+df <- df %>%
+  mutate(moca_executive_visuospatial = moca_executive + moca_visuospatial) %>%
+  select(-moca_executive, -moca_visuospatial)
+df <- df %>%
+  mutate(mmse_language_construction = mmse_do + mmse_repeat + mmse_name + mmse_read + mmse_write + mmse_draw) %>%
+  select(-mmse_do, -mmse_repeat, -mmse_name, -mmse_read, -mmse_write, -mmse_draw)
+
+# 创建 MMSE 子项命名映射
+name_map_mmse <- c(
+  mmse_orientation = "MMSE Orientation",
+  mmse_memory = "MMSE Immediate Recall",
+  mmse_recall = "MMSE Delayed Recall",
+  mmse_calculate = "MMSE Serial Subtraction",
+  mmse_language_construction = "MMSE Language/Construction"
+)
+# MoCA 子项命名映射
+name_map_moca <- c(
+  moca_executive_visuospatial = "MoCA Executive",
+  moca_naming = "MoCA Naming",
+  moca_attention_calculation = "MoCA Attention",
+  moca_language = "MoCA Language",
+  moca_abstraction = "MoCA Abstraction",
+  moca_recall = "MoCA Delayed Recall",
+  moca_recall_cue1 = "MoCA Cued Recall (Category)",
+  moca_recall_cue2 = "MoCA Cued Recall (Recognition)",
+  moca_orientation = "MoCA Orientation"
+)
+# 替换列名
+library(dplyr)
+name_map_all <- c(name_map_mmse, name_map_moca)
+colnames(df) <- ifelse(
+  colnames(df) %in% names(name_map_all),
+  name_map_all[colnames(df)],
+  colnames(df)
+)
+
+# 转化成有序分类变量
+target_cols_mmse <- unname(name_map_mmse)
+df[target_cols_mmse] <- lapply(df[target_cols_mmse], function(x) {
+  factor(x, levels = sort(unique(na.omit(x))), ordered = TRUE)
+})
+target_cols_moca <- unname(name_map_moca)
+df[target_cols_moca] <- lapply(df[target_cols_moca], function(x) {
+  factor(x, levels = sort(unique(na.omit(x))), ordered = TRUE)
+})
+
+# 认知综合
+cols_to_convert <- c(
+  "multiCOG_ActionImitation",
+  "multiCOG_BlockDesign",
+  "multiCOG_CopyTest",
+  "multiCOG_Repetition",
+  "multiCOG_Naming"
+)
+for (col in cols_to_convert) {
+  df[[col]] <- factor(df[[col]],
+                      levels = c("0(正常)", "1(异常(轻))", "2(异常(重))"),
+                      labels = c("normal", "mild", "severe"),
+                      ordered = TRUE)
+}
+df$multiCOG_ClockDrawing <- factor(df$multiCOG_ClockDrawing,
+                                   levels = c(0, 1, 2, 3),
+                                   ordered = TRUE)
+
+# 合并变量列表
+# 定义列名替换映射
+name_map_rzzh <- c(
+  "动物列名_Z" = "Animal Naming (Z)",
+  "数字符号_Z" = "Digit Symbol (Z)",
+  "接龙A时间_Z" = "Trail Making Time (Z)",
+  "Rey临摹_Z" = "Rey Copy (Z)",
+  "Rey回忆_Z" = "Rey Recall (Z)",
+  "情景记忆_Z" = "Logical Memory (Z)",
+  "相似性_Z" = "Similarities (Z)",
+  "计算_Z" = "Calculation (Z)",
+  
+  "avlt1" = "AVLT Trial 1",
+  "avlt2" = "AVLT Trial 2",
+  "avlt3" = "AVLT Trial 3",
+  "avlt4" = "AVLT Trial 4",
+  "avlt5" = "AVLT Trial 5",
+  "avlt6" = "AVLT Trial 6",
+  "avlti" = "AVLT-i",
+  "avltt" = "AVLT-t",
+  "再认击中" = "AVLT-hit",
+  
+  "multiCOG_ClockDrawing" = "Clock Drawing",
+  "multiCOG_ActionImitation" = "Action Imitation",
+  "multiCOG_BlockDesign" = "Block Design",
+  "multiCOG_CopyTest" = "Copying Test",
+  "multiCOG_Repetition" = "Sentence Repetition",
+  "multiCOG_Naming" = "Naming"
+)
+# 替换列名
+names(df) <- ifelse(names(df) %in% names(name_map_rzzh),
+                    name_map_rzzh[names(df)],
+                    names(df))
+
+```
+
+
+### MMSE分项
+```{r}
+### MMSE 分项 Kruskal-Wallis 检验 ###
+# 变量名: mmse_kruskal_df
+mmse_kruskal_results <- lapply(target_cols_mmse, function(col) {
+  test <- kruskal.test(as.formula(paste0("`", col, "` ~ ml_subtype")), data = df)
+  data.frame(Variable = col, p_value = test$p.value)
+})
+mmse_kruskal_df <- bind_rows(mmse_kruskal_results) %>% arrange(p_value)
+mmse_kruskal_df <- mmse_kruskal_df %>%
+  mutate(p_adjust_fdr = p.adjust(p_value, method = "fdr")) %>%
+  arrange(p_adjust_fdr)
+# print(mmse_kruskal_df) # 打印结果
+
+### MMSE 分项 Dunn’s test ###
+# 变量名: mmse_dunn_sig_results
+mmse_sig_vars <- mmse_kruskal_df %>% filter(p_adjust_fdr < 0.05) %>% pull(Variable)
+
+mmse_dunn_sig_results <- purrr::map_dfr(mmse_sig_vars, function(var) {
+  formula_str <- paste0("`", var, "` ~ ml_subtype")
+  df %>%
+    dunn_test(as.formula(formula_str), p.adjust.method = "fdr") %>%
+    mutate(Variable = var)
+})
+# print(mmse_dunn_sig_results, n=24) # 打印结果
+
+### MMSE 绘图数据准备 ###
+# 变量名: mmse_dunn_plot_data
+mmse_dunn_plot_data <- mmse_dunn_sig_results %>%
+  filter(p.adj < 0.05) %>% 
+  select(
+    Variable, 
+    group1, 
+    group2, 
+    p.adj.signif,
+    p.adj 
+  ) %>%
+  rename(Cognitive_Variable = Variable) %>%
+  # y.position 的计算需要依赖 df_long，这里先用一个默认值
+  mutate(y.position = 5.25) 
+print(mmse_dunn_plot_data) # 打印结果
+```
+
+
+### MoCA分项
+```{r}
+### MoCA 分项 Kruskal-Wallis 检验 ###
+# 变量名: moca_kruskal_df
+moca_kruskal_results <- lapply(target_cols_moca, function(col) {
+  test <- kruskal.test(as.formula(paste0("`", col, "` ~ ml_subtype")), data = df)
+  data.frame(Variable = col, p_value = test$p.value)
+})
+moca_kruskal_df <- bind_rows(moca_kruskal_results) %>% arrange(p_value)
+moca_kruskal_df <- moca_kruskal_df %>%
+  mutate(p_adjust_fdr = p.adjust(p_value, method = "fdr")) %>%
+  arrange(p_adjust_fdr)
+# print(moca_kruskal_df) # 打印结果
+
+### MoCA 分项 Dunn’s test ###
+# 变量名: moca_dunn_sig_results
+moca_sig_vars <- moca_kruskal_df %>% filter(p_adjust_fdr < 0.05) %>% pull(Variable)
+
+moca_dunn_sig_results <- purrr::map_dfr(moca_sig_vars, function(var) {
+  df %>%
+    dunn_test(as.formula(paste0("`", var, "` ~ ml_subtype")),
+              p.adjust.method = "fdr") %>%
+    mutate(Variable = var)
+})
+# print(moca_dunn_sig_results, n=30) # 打印结果
+
+### MoCA 绘图数据准备 ###
+moca_dunn_plot_data <- moca_dunn_sig_results %>%
+  filter(p.adj < 0.05) %>% 
+  select(
+    Variable, 
+    group1, 
+    group2, 
+    p.adj.signif,
+    p.adj 
+  ) %>%
+  rename(Cognitive_Variable = Variable) %>%
+  # y.position 的计算需要依赖 df_long，这里先用一个默认值
+  mutate(y.position = 5.25) 
+print(moca_dunn_plot_data) # 打印结果
+
+```
+
+### 认知综合 & AVLT
+```{r}
+continuous_vars <- c(
+  "AVLT Trial 1", "AVLT Trial 2", "AVLT Trial 3", "AVLT Trial 4", "AVLT Trial 5", "AVLT Trial 6",
+  "AVLT-i", "AVLT-t", "AVLT-hit",
+  "Animal Naming (Z)", "Digit Symbol (Z)", "Trail Making Time (Z)", "Rey Copy (Z)",
+  "Rey Recall (Z)", "Logical Memory (Z)", "Similarities (Z)", "Calculation (Z)"
+)
+ordinal_vars <- c(
+  "Clock Drawing", "Action Imitation", "Block Design", "Copying Test",
+  "Sentence Repetition", "Naming")
+all_vars <- unname(name_map_rzzh)
+
+# 批量 Kruskal-Wallis 检验 (使用 all_vars 列表)
+avlt_kruskal_results <- map_dfr(all_vars, function(col) {
+  test_data <- df %>% select(ml_subtype, !!sym(col)) %>% na.omit()
+  formula_text <- paste0("`", col, "` ~ ml_subtype") 
+  test <- kruskal.test(as.formula(formula_text), data = test_data)
+  data.frame(
+    Variable = col,
+    p_value = test$p.value
+  )
+})
+
+# FDR 校正并统一变量名
+avlt_kruskal_df <- avlt_kruskal_results %>%
+  mutate(p_adjust_fdr = p.adjust(p_value, method = "fdr")) %>%
+  arrange(p_adjust_fdr)
+# print(avlt_kruskal_df) # 打印结果
+
+# -----------------------------------------------------------
+### 认知综合 & AVLT Dunn’s test #### 变量名: avlt_dunn_sig_results
+# -----------------------------------------------------------
+library(rstatix)
+# 筛选 FDR 校正后显著的变量 (统一使用 p_adjust_fdr)
+avlt_sig_vars <- avlt_kruskal_df %>% filter(p_adjust_fdr < 0.05) %>% pull(Variable)
+
+# Dunn 检验（FDR校正），循环所有显著变量
+avlt_dunn_sig_results <- purrr::map_dfr(avlt_sig_vars, function(var) {
+  test_data <- df %>% select(ml_subtype, !!sym(var)) %>% na.omit()
+  formula_str <- paste0("`", var, "` ~ ml_subtype")
+  dunn_out <- dunn_test(test_data, formula = as.formula(formula_str), 
+                        p.adjust.method = "fdr") %>%
+    mutate(Variable = var)
+  return(dunn_out)
+})
+# print(avlt_dunn_sig_results, n=60) # 打印结果
+
+# -----------------------------------------------------------
+### 认知综合 & AVLT 绘图数据准备 #### 变量名: avlt_dunn_plot_data
+# -----------------------------------------------------------
+avlt_dunn_plot_data <- avlt_dunn_sig_results %>%
+  filter(p.adj < 0.05) %>% 
+  select(
+    Variable, 
+    group1, 
+    group2, 
+    p.adj.signif,
+    p.adj 
+  ) %>%
+  rename(Cognitive_Variable = Variable) %>%
+  # y.position 的计算需要依赖 df_long，这里先用一个默认值 (与 MoCA/MMSE 保持一致)
+  mutate(y.position = 5.25) 
+
+print(avlt_dunn_plot_data) # 打印结果
+```
+
+
+
+
+### 最终数据合并
+```{r}
+# -----------------------------------------------------------
+# 1. 统一显著性数据的 y.position 计算函数
+# -----------------------------------------------------------
+prepare_plot_data <- function(df_long, dunn_results_raw) {
+  # 1.1 计算每个变量的最大分数
+  max_scores <- df_long %>%
+    group_by(Cognitive_Variable) %>%
+    summarise(max_score = max(Score, na.rm = TRUE)) %>%
+    ungroup()
+  
+  # 1.2 准备绘图数据并动态计算 y.position
+  plot_data <- dunn_results_raw %>%
+    filter(p.adj < 0.05) %>%
+    select(Variable, group1, group2, p.adj.signif, p.adj) %>%
+    rename(Cognitive_Variable = Variable) %>%
+    
+    # 关联最大分数
+    left_join(max_scores, by = "Cognitive_Variable") %>%
+    
+    # 分组计算 y.position (同一变量内的比较要堆叠)
+    group_by(Cognitive_Variable) %>%
+    mutate(
+      # y.position = MaxScore * (基础高度 + 堆叠增量 * 比较序号)
+      y.position = max_score * (1.2 + 0.10 * (row_number() - 1))
+    ) %>%
+    ungroup() %>%
+    select(-max_score)
+  
+  return(plot_data)
+}
+
+# -----------------------------------------------------------
+# 2. MMSE 数据准备
+# -----------------------------------------------------------
+# 绘图前对 MMSE 数据的处理 (修正类型错误)
+mmse_sig_vars <- mmse_kruskal_df %>% filter(p_adjust_fdr < 0.05) %>% pull(Variable)
+
+df_mmse_plot <- df %>%
+  select(all_of(mmse_sig_vars), ml_subtype) %>%
+  mutate(across(all_of(mmse_sig_vars), as.numeric)) # 强制转换为数值型
+
+mmse_df_long <- df_mmse_plot %>%
+  mutate(ml_subtype = factor(ml_subtype, levels = c("1", "2", "3", "4"))) %>%
+  pivot_longer(
+    cols = -ml_subtype,
+    names_to = "Cognitive_Variable",
+    values_to = "Score"
+  )
+
+# 重新计算 mmse_dunn_plot_data 中的 y.position (动态计算)
+mmse_dunn_plot_data <- prepare_plot_data(mmse_df_long, mmse_dunn_sig_results)
+
+
+# -----------------------------------------------------------
+# 3. MoCA 数据准备
+# -----------------------------------------------------------
+moca_sig_vars <- moca_kruskal_df %>% filter(p_adjust_fdr < 0.05) %>% pull(Variable)
+
+df_moca_plot <- df %>%
+  select(all_of(moca_sig_vars), ml_subtype) %>%
+  mutate(across(all_of(moca_sig_vars), as.numeric)) 
+
+moca_df_long <- df_moca_plot %>%
+  mutate(ml_subtype = factor(ml_subtype, levels = c("1", "2", "3", "4"))) %>%
+  pivot_longer(
+    cols = -ml_subtype,
+    names_to = "Cognitive_Variable",
+    values_to = "Score"
+  )
+
+# 重新计算 moca_dunn_plot_data 中的 y.position (动态计算)
+moca_dunn_plot_data <- prepare_plot_data(moca_df_long, moca_dunn_sig_results)
+
+# -----------------------------------------------------------
+# 4. AVLT/认知综合数据准备
+# -----------------------------------------------------------
+# 注意：我们必须包含所有显著变量，包括 Z-scores 和可能的序数变量
+df_avlt_plot <- df %>%
+  select(all_of(avlt_sig_vars), ml_subtype)
+# 对于有序因子 (Ordered Factor)，as.numeric 会将其转换为 1, 2, 3... 的整数等级
+df_avlt_plot <- df_avlt_plot %>%
+  mutate(across(all_of(avlt_sig_vars), as.numeric))
+
+avlt_df_long <- df_avlt_plot %>%
+  mutate(ml_subtype = factor(ml_subtype, levels = c("1", "2", "3", "4"))) %>%
+  pivot_longer(
+    cols = -ml_subtype,
+    names_to = "Cognitive_Variable",
+    values_to = "Score"
+  )
+
+max_scores_avlt <- avlt_df_long %>%
+  group_by(Cognitive_Variable) %>%
+  summarise(max_score = max(Score, na.rm = TRUE)) %>%
+  ungroup()
+
+# 2. 准备绘图数据并计算 y.position
+avlt_dunn_plot_data <- avlt_dunn_sig_results %>%
+  filter(p.adj < 0.05) %>%
+  select(
+    Variable, 
+    group1, 
+    group2, 
+    p.adj.signif, 
+    p.adj 
+  ) %>%
+  rename(Cognitive_Variable = Variable) %>%
+  # 加入 max_score
+  left_join(max_scores_avlt, by = "Cognitive_Variable") %>%
+  # 动态计算 y.position
+  group_by(Cognitive_Variable) %>%
+  mutate(
+    # 计算当前是第几层显著性连线 (0, 1, 2...)
+    step_index = row_number() - 1,
+    y.position = case_when(
+      # 【特判 1】: 针对 Rey Copy (Z) 这种范围大但最大值小的变量
+      # max_score + 起始缓冲(2) + (层数 * 步长(3))
+      # 注意：这里的 3 是步长，如果觉得线还是挤，就把 3 改成 4 或 5
+      Cognitive_Variable == "Rey Copy (Z)" ~ max_score + 2 + (step_index * 3),
+      
+      # 【特判 2】: 针对其他 Z-score 或最大值较小的变量 (比如 < 5)
+      # 策略：加法模式，但步长小一点
+      max_score <= 8 ~ max_score * (1.3 + 0.2*step_index),
+      
+      # 【默认】: 针对 AVLT 等大数值变量
+      # 策略：乘法模式
+      TRUE ~ max_score + 0.2 + step_index*1
+    )
+  ) %>%
+  ungroup() %>%
+  select(-max_score, -step_index) # 清理中间变量
+
+
+# -----------------------------------------------------------
+# 5. 最终合并
+# -----------------------------------------------------------
+
+# 合并所有长格式数据
+combined_df_long_all <- bind_rows(mmse_df_long, moca_df_long, avlt_df_long)
+
+# 合并所有显著性数据
+combined_dunn_plot_data_all <- bind_rows(mmse_dunn_plot_data, moca_dunn_plot_data, avlt_dunn_plot_data)
+
+# 确定最终变量顺序 (保持不变)
+ordered_vars <- c(
+  "MMSE Serial Subtraction", "MoCA Executive", "MoCA Attention", 
+  "Trail Making Time (Z)", "Digit Symbol (Z)", "Calculation (Z)", "Clock Drawing", "Copying Test", "Rey Copy (Z)", 
+  "MMSE Delayed Recall", "MoCA Delayed Recall", "MoCA Cued Recall (Category)", "AVLT Trial 4", "AVLT Trial 6", 
+  "MoCA Naming" 
+)
+
+# 应用顺序
+combined_df_long_all$Cognitive_Variable <- factor(
+  combined_df_long_all$Cognitive_Variable, 
+  levels = ordered_vars[ordered_vars %in% unique(combined_df_long_all$Cognitive_Variable)]
+)
+combined_dunn_plot_data_all$Cognitive_Variable <- factor(
+  combined_dunn_plot_data_all$Cognitive_Variable, 
+  levels = ordered_vars[ordered_vars %in% unique(combined_dunn_plot_data_all$Cognitive_Variable)]
+)
+
+# 打印新的显著性数据，确保 y.position 是动态堆叠的
+print(combined_dunn_plot_data_all, n = 30)
+```
+
+### 设置Figures变量
+```{r}
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(ggpubr)
+library(ggh4x)
+
+# 定义哪些变量需要画成纯箱型图
+box_only_vars <- c(
+  "Trail Making Time (Z)", 
+  "Digit Symbol (Z)", 
+  "Calculation (Z)", 
+  "Rey Copy (Z)", 
+  "AVLT Trial 4", 
+  "AVLT Trial 6"
+)
+vars_ordered <- levels(combined_df_long_all$Cognitive_Variable)
+label_data <- data.frame(
+  Cognitive_Variable = factor(vars_ordered, levels = vars_ordered), # 确保分面对应
+  Label = LETTERS[1:length(vars_ordered)]                           # 生成 A, B, C...
+)
+```
+
+```{r}
+final_combined_plot <- ggplot(combined_df_long_all, aes(x = ml_subtype, y = Score, fill = ml_subtype)) +
+  
+  # --- (中间的 geom_violin, boxplot, jitter, stat_pvalue_manual 代码保持不变) ---
+  geom_violin(data = . %>% filter(!Cognitive_Variable %in% box_only_vars), trim = FALSE, color = "gray30", alpha = 0.8) +
+  geom_boxplot(data = . %>% filter(!Cognitive_Variable %in% box_only_vars), width = 0.2, outlier.shape = NA, color = "gray30", fill = "white") +
+  geom_boxplot(data = . %>% filter(Cognitive_Variable %in% box_only_vars), width = 0.7, outlier.shape = NA, color = "gray30", alpha = 0.8) +
+  geom_jitter(width = 0.15, size = 0.6, alpha = 0.5) +
+  stat_pvalue_manual(combined_dunn_plot_data_all, label = "p.adj.signif", y.position = "y.position", step.increase = 0, tip.length = 0.01, size = 2.5, bracket.size = 0.4, hide.ns = TRUE) +
+  
+  facet_wrap(~ Cognitive_Variable, scales = "free_y", ncol = 4) + 
+  scale_fill_manual(values = c("#374E55FF", "#DF8F44FF", "#00A1D5FF", "#B24745FF")) +
+  
+  # --- 🔥🔥 修改点 1：geom_text 的位置调整 🔥🔥 ---
+  geom_text(
+    data = label_data,
+    aes(label = Label),
+    x = -Inf,               # 改为 -Inf，让它自动贴到最左边的边缘
+    y = Inf,                # y = Inf 代表贴着图的顶端
+    hjust = 1.5,             # 负数代表向右缩进一点点，不要紧贴边框
+    vjust = -0.73,             # 🔥 关键：负数代表“向上”移动，把它推到标题行的高度
+    size = 3,               # 字体稍微改大一点点
+    fontface = "bold",
+    inherit.aes = FALSE
+  ) +
+
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position = "none",
+    
+    # --- 🔥🔥 修改点 2：移除标题行的背景颜色 🔥🔥 ---
+    # 必须把背景设为透明或空白，否则它永远会盖住你的 geom_text
+    strip.background = element_blank(), 
+    
+    strip.text = element_text(face = "bold", size = 8, hjust = 0.5),
+    axis.text = element_text(size = 8),
+    axis.title = element_text(size = 9),
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold", size = 8, hjust = 0.5),
+    
+    # --- 🔥🔥 修改点 3：增加顶部边距 🔥🔥 ---
+    # 因为文字被推到了图外面，可能会被保存图片的边缘切掉，所以上面要留白
+    plot.margin = margin(t = 20, r = 10, b = 10, l = 10) 
+  ) +
+  
+  labs(x = "Subtype", y = "Score / Z-score") +
+
+  # --- 🔥🔥 修改点 4：关闭裁剪 (Magic Key) 🔥🔥 ---
+  # 这行代码允许 geom_text 画在格子外面
+  coord_cartesian(clip = "off") +
+
+  # --- Copying Test 自定义坐标轴 (保持不变) ---
+  facetted_pos_scales(
+    y = list(
+      Cognitive_Variable == "Copying Test" ~ scale_y_continuous(
+        breaks = c(1, 2, 3), 
+        labels = c("Normal", "Mild", "Severe"), 
+        limits = c(0.5, 4.5)
+      )
+    )
+  )
+
+print(final_combined_plot)
+```
+
+### 保存
+```{r}
+# 设置保存目录
+save_dir <- "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig"
+
+# 1. 保存为 PDF
+ggsave(
+  filename = file.path(save_dir, "Cognitive_Subitems.pdf"),
+  plot = final_combined_plot,
+  width = 8, 
+  height = 6,
+  device = cairo_pdf # 使用 cairo_pdf 更好支持符号和字体
+)
+
+# 2. 保存为 TIFF (300 dpi, LZW 压缩)
+ggsave(
+  filename = file.path(save_dir, "Cognitive_Subitems.tiff"),
+  plot = final_combined_plot,
+  width = 8, 
+  height = 6,
+  dpi = 300,
+  compression = "lzw", # 使用无损压缩，防止文件过大
+  bg = "white"         # 确保背景不是透明的
+)
+```
+
+
+
+
+

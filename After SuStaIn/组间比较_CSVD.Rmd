@@ -1,0 +1,478 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# 数据准备
+```{r}
+library(tidyverse)
+library(dplyr)
+library(readr)
+library(FSA)        # Dunn test
+library(rstatix)    # tidy 问法的统计
+options(scipen = 999)
+
+# 读入数据
+df <- read_csv("/Users/qiuyuyue/Documents/MRI/data/SuStaIn/原sustain_result_FINAL_MERGED2.csv")
+
+# 确保 ml_subtype 是 factor
+df$ml_subtype <- factor(df$ml_subtype, levels = c(1,2,3,4))
+df <- df %>%
+  mutate(
+    DWMH_pct = DWMH_v*100 / ICV,
+    PWMH_pct = PWMH_v*100 / ICV,
+    CMB_pct = CMB_Total_v*100 / ICV,
+    PVS_pct = PVS_Total_v*100 / ICV,
+    LA_pct = LA_Total_v*100 / ICV
+  )
+
+# 需要比较的 biomarkers
+csvd <- c("PWMH_pct", "DWMH_pct", "CMB_num", "PVS_num")
+df <- df %>%drop_na(all_of(csvd))
+print(nrow(df))
+
+```
+# 三高
+```{r}
+# 需要比较的二分类变量
+bin_vars <- c("高血压", "高血脂", "糖尿病")
+
+# 保存结果
+binary_test_results <- list()
+
+for (var in bin_vars) {
+  # 列联表
+  tab <- table(df$ml_subtype, df[[var]])
+  
+  # 判断是否需要 Fisher（如果任意一个 cell <5）
+  if (any(tab < 5)) {
+    test_res <- fisher.test(tab)
+    method <- "Fisher's Exact Test"
+  } else {
+    test_res <- chisq.test(tab)
+    method <- "Chi-square Test"
+  }
+  
+  binary_test_results[[var]] <- list(
+    variable = var,
+    method = method,
+    table = tab,
+    p_value = test_res$p.value
+  )
+}
+
+# 查看所有结果
+binary_test_results
+
+```
+
+
+# KW
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+
+kw_results <- df %>%
+  dplyr::select(ml_subtype, all_of(csvd)) %>%
+  pivot_longer(cols = all_of(csvd), names_to = "csvd", values_to = "value") %>%
+  drop_na(value) %>% # 确保在进行统计检验前移除 NA 值
+  group_by(csvd) %>%
+  summarise(
+    # 运行检验并保存完整结果列表
+    test_output = list(kruskal.test(value ~ ml_subtype)), 
+    .groups = 'drop' # 保持代码简洁，直接解组
+  ) %>%
+  # 提取所需的统计信息
+  mutate(
+    statistic = map_dbl(test_output, ~ .$statistic), # 提取 Kruskal-Wallis χ² (H) 统计量
+    df = map_dbl(test_output, ~ .$parameter),       # 提取自由度 (df)
+    p = map_dbl(test_output, ~ .$p.value)           # 提取 P 值
+  ) %>%
+  # 进行 FDR (BH) 校正
+  mutate(
+    p_adj = p.adjust(p, method = "fdr")
+  ) %>%
+  # 仅保留关键结果列
+  dplyr::select(csvd, statistic, df, p, p_adj)
+
+print(kw_results)
+```
+
+
+
+# Dunn
+```{r}
+sig_csvd <- c("DWMH_pct", "CMB_num", "PVS_num")
+
+dunn_results <- df %>%
+  dplyr::select(ml_subtype, all_of(sig_csvd)) %>%
+  pivot_longer(cols = sig_csvd, names_to = "csvd", values_to = "value") %>%
+  group_by(csvd) %>%
+  do(
+    FSA::dunnTest(value ~ ml_subtype, data = ., method = "bh")$res
+  )%>%
+  add_significance("P.adj")
+
+print(dunn_results)
+```
+
+# 可视化
+```{r}
+library(ggpubr)
+library(tidyverse)
+library(rstatix)
+
+# 1. 数据准备
+plot_data <- df %>%
+  dplyr::select(ml_subtype, all_of(csvd)) %>%
+  pivot_longer(cols = all_of(csvd), names_to = "csvd", values_to = "value") %>%
+  mutate(ml_subtype = as.factor(ml_subtype)) %>%
+  drop_na()
+
+# 2. 
+stat.test <- plot_data %>%
+  group_by(csvd) %>%
+  group_modify(~ {
+    .x %>%
+      wilcox_test(value ~ ml_subtype) %>%
+      adjust_pvalue(method = "BH") %>%
+      add_significance() %>%
+      filter(p.adj < 0.05) %>%
+      # 这里的 step.increase 现在只针对当前的 csvd 生效
+      add_xy_position(x = "ml_subtype", step.increase = 0.05) 
+  }) %>%
+  ungroup() # 记得解组
+
+# 3. 绘图
+ggboxplot(plot_data, x = "ml_subtype", y = "value",
+          fill = "ml_subtype", palette = "jama",
+          add = "jitter",
+          facet.by = "csvd", scales = "free_y",
+          short.panel.labs = FALSE,
+          outlier.shape = NA) + 
+  
+  # 绘制显著性标记
+  stat_pvalue_manual(stat.test, label = "p.adj.signif", 
+                     tip.length = 0.01, 
+                     hide.ns = TRUE) +
+  
+  # 调整 Y 轴留白：顶部留 15% 空间给星号，底部留 5%
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  
+  theme_bw() +
+  labs(x = "ML Subtype", y = "CSVD")
+
+
+```
+```{r}
+library(ggpubr)
+library(dplyr)
+library(tidyr) 
+
+plot_PWMH <- ggboxplot(df, x = "ml_subtype", y = "PWMH_pct",
+                      fill = "ml_subtype",      # 👈 修改这里：用 fill 填充颜色
+                      palette = "jama",         # 使用 jama 配色
+                      alpha = 0.8,              # 👈 0.8 不透明度，看起来更有质感
+                      add = "jitter",           # 添加散点
+                      add.params = list(size = 1.5, alpha = 0.6), # 调整散点大小和透明度
+                      outlier.shape = NA) +     # 👈 隐藏箱线图自带的离群点，避免与 jitter 重复
+  stat_pvalue_manual(
+    dunn_results %>% 
+      separate(Comparison, into = c("group1", "group2"), sep = " - ", remove = FALSE) %>% 
+      filter(csvd == "PWMH_pct") %>%
+      filter(P.adj < 0.05) %>%
+      mutate(y.position = seq(1.25, by = 0.06, length.out = n())),
+    label = "P.adj.signif",
+    tip.length = 0.005 # 👈 重点修改：添加此行来控制短竖线的长度
+  ) +
+  labs(x = "Subtype", y = "PWMH (%)") +
+  theme(legend.position = "none") + 
+  ggplot2::coord_cartesian(ylim = c(0, 1.5))
+
+plot_DWMH <- ggboxplot(df, x = "ml_subtype", y = "DWMH_pct",
+                      fill = "ml_subtype",      # 👈 修改这里：用 fill 填充颜色
+                      palette = "jama",         # 使用 jama 配色
+                      alpha = 0.8,              # 👈 0.8 不透明度，看起来更有质感
+                      add = "jitter",           # 添加散点
+                      add.params = list(size = 1.5, alpha = 0.6), # 调整散点大小和透明度
+                      outlier.shape = NA) +     # 👈 隐藏箱线图自带的离群点，避免与 jitter 重复
+  stat_pvalue_manual(
+    dunn_results %>% 
+      separate(Comparison, into = c("group1", "group2"), sep = " - ", remove = FALSE) %>% 
+      filter(csvd == "DWMH_pct") %>%
+      filter(P.adj < 0.05) %>%
+      mutate(y.position = seq(1.25, by = 0.06, length.out = n())),
+    label = "P.adj.signif",
+    tip.length = 0.005 # 👈 重点修改：添加此行来控制短竖线的长度
+  ) +
+  labs(x = "Subtype", y = "DWMH (%)") +
+  theme(legend.position = "none") + 
+  ggplot2::coord_cartesian(ylim = c(0, 1.5))
+
+
+plot_CMB <- ggboxplot(df, x = "ml_subtype", y = "CMB_num",
+                      fill = "ml_subtype",      # 👈 修改这里：用 fill 填充颜色
+                      palette = "jama",         # 使用 jama 配色
+                      alpha = 0.8,              # 👈 0.8 不透明度，看起来更有质感
+                      add = "jitter",           # 添加散点
+                      add.params = list(size = 1.5, alpha = 0.6), # 调整散点大小和透明度
+                      outlier.shape = NA) +     # 👈 隐藏箱线图自带的离群点，避免与 jitter 重复
+  stat_pvalue_manual(
+    dunn_results %>% 
+      separate(Comparison, into = c("group1", "group2"), sep = " - ", remove = FALSE) %>% 
+      filter(csvd == "CMB_num") %>%
+      filter(P.adj < 0.05) %>%
+      mutate(y.position = seq(13, by = 0.6, length.out = n())),
+    label = "P.adj.signif",
+    tip.length = 0.0007 # 👈 重点修改：添加此行来控制短竖线的长度
+  ) +
+  labs(x = "Subtype", y = "CMB (n)") +
+  theme(legend.position = "none") + 
+  ggplot2::coord_cartesian(ylim = c(0, 15))
+
+plot_PVS <- ggboxplot(df, x = "ml_subtype", y = "PVS_num",
+                      fill = "ml_subtype",      # 👈 修改这里：用 fill 填充颜色
+                      palette = "jama",         # 使用 jama 配色
+                      alpha = 0.8,              # 👈 0.8 不透明度，看起来更有质感
+                      add = "jitter",           # 添加散点
+                      add.params = list(size = 1.5, alpha = 0.6), # 调整散点大小和透明度
+                      outlier.shape = NA) +     # 👈 隐藏箱线图自带的离群点，避免与 jitter 重复
+  stat_pvalue_manual(
+    dunn_results %>% 
+      separate(Comparison, into = c("group1", "group2"), sep = " - ", remove = FALSE) %>% 
+      filter(csvd == "PVS_num") %>%
+      filter(P.adj < 0.05) %>%
+      mutate(y.position = seq(610, by = 25, length.out = n())),
+    label = "P.adj.signif",
+    tip.length = 0.01 # 👈 重点修改：添加此行来控制短竖线的长度
+  ) +
+  labs(x = "Subtype", y = "PVS (n)") +
+  theme(legend.position = "none") + 
+  ggplot2::coord_cartesian(ylim = c(0, 680))
+
+plot_LA <- ggboxplot(df, x = "ml_subtype", y = "LA_num",
+                      fill = "ml_subtype",      # 👈 修改这里：用 fill 填充颜色
+                      palette = "jama",         # 使用 jama 配色
+                      alpha = 0.8,              # 👈 0.8 不透明度，看起来更有质感
+                      add = "jitter",           # 添加散点
+                      add.params = list(size = 1.5, alpha = 0.6), # 调整散点大小和透明度
+                      outlier.shape = NA) +     # 👈 隐藏箱线图自带的离群点，避免与 jitter 重复
+  stat_pvalue_manual(
+    dunn_results %>% 
+      separate(Comparison, into = c("group1", "group2"), sep = " - ", remove = FALSE) %>% 
+      filter(csvd == "LA_num") %>%
+      filter(P.adj < 0.05) %>%
+      mutate(y.position = seq(13, by = 0.6, length.out = n())),
+    label = "P.adj.signif",
+    tip.length = 0.0007 # 👈 重点修改：添加此行来控制短竖线的长度
+  ) +
+  labs(x = "Subtype", y = "LA (n)") +
+  theme(legend.position = "none") + 
+  ggplot2::coord_cartesian(ylim = c(0, 15))
+
+CSVD_plot <- ggarrange(plot_PWMH, plot_DWMH, plot_CMB, plot_PVS,
+          ncol = 2, nrow = 2,
+          labels = c("A", "B", "C", "D"))
+
+ggexport(
+  CSVD_plot, 
+  filename = "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/CSVD_plot.pdf", 
+  width = 6,  # 图像宽度 (英寸)
+  height = 6   # 图像高度 (英寸)
+  # PDF 文件是矢量图，不需要设置 res 参数
+)
+CSVD_plot
+
+```
+
+
+# 中介效应和结构方程模型
+```{r}
+library(mediation)
+library(dplyr)
+
+# 1. 读取数据
+df <- read.csv("/Users/qiuyuyue/Documents/MRI/data/SuStaIn/原sustain_result_FINAL_MERGED.csv")
+
+# 2. 数据预处理
+# 将 ml_type 转换为二值变量 (是否为 Type 4)
+df$is_type4 <- ifelse(df$ml_subtype == 4, 1, 0)
+
+# 1. 定义分析所需的所有列名 (请确保 Age 和 Sex 列名正确)
+analysis_vars <- c("DWMH_v", "is_type4", "lumi_Ab42", "age", "sex", "ICV") # 替换 mediator 为实际变量名
+
+# 2. 筛选出所需变量，并删除包含任何 NA 值的行
+df <- df %>%
+  filter(if_all(all_of(analysis_vars), ~ !is.na(.x)))
+# 执行标准化
+vars_to_standardize <- c("DWMH_v", "lumi_Ab42", "lumi_pTau181", "lumi_tTau", "age", "ICV")
+df_std <- df %>% mutate(across(all_of(vars_to_standardize), ~ scale(.)[,1]))
+
+head(df_std)
+```
+
+
+# 探索biomarker是否部分中介了Subtype4中的高DWMH
+```{r}
+library(lavaan)
+
+model_syntax <- '
+  # =======================================================
+  # 路径 A: 自变量 → 三个中介
+  # =======================================================
+  lumi_tTau ~ a1 * is_type4 + age + sex + ICV
+  lumi_Ab42 ~ a2 * is_type4 + age + sex + ICV
+  lumi_pTau181 ~ a3 * is_type4 + age + sex + ICV
+
+  # =======================================================
+  # 路径 B 和 C_prime: 三个中介 + 自变量 → 因变量
+  # =======================================================
+  DWMH_v ~ c_prime * is_type4 + 
+           b1 * lumi_tTau +
+           b2 * lumi_Ab42 +
+           b3 * lumi_pTau181 +
+           age + sex + ICV
+
+  # =======================================================
+  # 三个中介的残差相关
+  # =======================================================
+  lumi_tTau ~~ lumi_Ab42
+  lumi_tTau ~~ lumi_pTau181
+  lumi_Ab42 ~~ lumi_pTau181
+
+  # =======================================================
+  # 定义三条间接效应
+  # =======================================================
+  indirect_tTau    := a1 * b1
+  indirect_Ab42    := a2 * b2
+  indirect_pTau181 := a3 * b3
+
+  # 总间接效应
+  total_indirect := indirect_tTau + indirect_Ab42 + indirect_pTau181
+
+  # 总效应
+  total_effect := c_prime + total_indirect
+'
+
+# 拟合模型
+fit <- sem(
+  model_syntax,
+  data = df_std,
+  se = "bootstrap",
+  bootstrap = 1000
+)
+
+summary(fit, standardized = TRUE, fit.measures = TRUE, ci = TRUE)
+
+```
+
+
+
+
+```{r}
+# 1. 安装并加载专用绘图包
+if(!require(diagram)) install.packages("diagram")
+library(diagram)
+
+# 2. 设置画布保存 (可选: 如果想直接保存为PDF，取消下面这行的注释)
+# pdf("Figure_Mediation_Final.pdf", width = 8, height = 6)
+
+# 3. 准备绘图参数
+par(mar = c(1, 1, 1, 1)) # 减少页边距
+openplotmat() # 初始化画布
+
+# --- 定义节点位置 (坐标 0-1 之间) ---
+# 布局：左(自变量), 中(三个中介), 右(因变量)
+pos_X    <- c(0.15, 0.5)  # Type 4
+pos_Y    <- c(0.85, 0.5)  # DWMH
+pos_M_up <- c(0.50, 0.8)  # t-Tau (上)
+pos_M_mi <- c(0.50, 0.5)  # Abeta42 (中 - 核心)
+pos_M_dn <- c(0.50, 0.2)  # p-Tau181 (下)
+
+# --- 定义变量文字 ---
+# 这里可以直接改名，比如加上单位
+lab_X <- "ML Subtype 4"
+lab_Y <- "DWMH Volume"
+lab_M_up <- "Plasma t-Tau"
+lab_M_mi <- "Plasma A\u03b242" # \u03b2 是 beta 符号
+lab_M_dn <- "Plasma p-Tau181"
+
+# --- 绘制矩形框 ---
+# 核心显著变量用实线框，非显著用虚线或普通框
+textrect(mid = pos_X, radx = 0.1, rady = 0.05, lab = lab_X, shadow.size = 0, box.col = "white", cex = 1.2)
+textrect(mid = pos_Y, radx = 0.1, rady = 0.05, lab = lab_Y, shadow.size = 0, box.col = "white", cex = 1.2)
+textrect(mid = pos_M_up, radx = 0.1, rady = 0.05, lab = lab_M_up, shadow.size = 0, box.col = "white", lty = 2, cex = 1) # 虚线框表示非显著中介
+textrect(mid = pos_M_mi, radx = 0.1, rady = 0.05, lab = lab_M_mi, shadow.size = 0, box.col = "#E6E6FA", cex = 1.2) # 淡紫色底色突出显著中介
+textrect(mid = pos_M_dn, radx = 0.1, rady = 0.05, lab = lab_M_dn, shadow.size = 0, box.col = "white", lty = 2, cex = 1)
+
+# --- 绘制箭头与系数 (核心部分) ---
+# 使用 straightarrow (直线) 或 curvedarrow (曲线)
+
+# 1. 显著路径：Type 4 -> Abeta42 (Path a)
+straightarrow(from = pos_X, to = pos_M_mi, lcol = "black", lwd = 2, arr.pos = 0.5, arr.length = 0.25)
+text(0.32, 0.52, labels = "-0.813***", cex = 1, font = 2) # 手动调整位置确保不重叠
+
+# 2. 显著路径：Abeta42 -> DWMH (Path b)
+straightarrow(from = pos_M_mi, to = pos_Y, lcol = "black", lwd = 2, arr.pos = 0.5, arr.length = 0.25)
+text(0.68, 0.52, labels = "-0.171*", cex = 1, font = 2)
+
+# 3. 显著路径：直接效应 (Path c') - 画一条曲线绕开中间
+curvedarrow(from = pos_X, to = pos_Y, curve = -0.3, lcol = "black", lwd = 2, arr.pos = 0.5, lty = 1)
+text(0.5, 0.25, labels = "Direct Effect: 1.205**", cex = 1, font = 2) # 放在曲线下方
+
+# --- 绘制不显著路径 (虚线) ---
+# Type 4 -> t-Tau
+straightarrow(from = pos_X, to = pos_M_up, lcol = "gray", lwd = 1, lty = 2, arr.pos = 0.6)
+# Type 4 -> p-Tau
+straightarrow(from = pos_X, to = pos_M_dn, lcol = "gray", lwd = 1, lty = 2, arr.pos = 0.6)
+# t-Tau -> DWMH
+straightarrow(from = pos_M_up, to = pos_Y, lcol = "gray", lwd = 1, lty = 2, arr.pos = 0.4)
+# p-Tau -> DWMH
+straightarrow(from = pos_M_dn, to = pos_Y, lcol = "gray", lwd = 1, lty = 2, arr.pos = 0.4)
+
+# --- 添加图注信息 ---
+text(0.5, 0.1, "Indirect Effect via A\u03b242: 0.139*", cex = 1.1, font = 2)
+text(0.5, 0.05, "Adjusted for Age, Sex, ICV", cex = 0.8, col = "gray40")
+
+# 如果之前使用了pdf()，记得关闭
+# dev.off()
+```
+
+
+
+```{r}
+# 定义变量名 (根据您实际的列名修改 Age 和 Sex)
+mediator <- "lumi_Ab42"      # 中介变量 M
+outcome <- "DWMH_v"          # 因变量 Y
+treatment <- "is_type4"      # 自变量 X
+covariates <- "age + sex + ICV"    # 协变量
+
+# --- 分析步骤 ---
+# Step 1: 模型 M (Mediator model): X -> M
+# 检验 Type 4 对 Biomarker 的影响 (控制年龄性别)
+f_med <- as.formula(paste(mediator, "~", treatment, "+", covariates))
+model_m <- lm(f_med, data = df_std)
+
+# Step 2: 模型 Y (Outcome model): X + M -> Y
+# 检验 Biomarker 对 DWMH 的影响 (控制 Type 4 和年龄性别)
+f_out <- as.formula(paste(outcome, "~", treatment, "+", mediator, "+", covariates))
+model_y <- lm(f_out, data = df_std)
+
+# Step 3: 运行中介分析 (使用 Bootstrap 方法，重复 1000 次)
+# 这是 R 的杀手锏，自动计算 ACME 和置信区间
+results <- mediate(model_m, model_y, treat = treatment, mediator = mediator, boot = TRUE, sims = 1000)
+
+# 4. 查看结果
+summary(results)
+```
+
+
+
+
+
+
+
+
+
+

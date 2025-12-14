@@ -1,0 +1,361 @@
+---
+title: "历次mmse混合效应模型"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
+# 合并历次mmse（不用再次执行）
+```{r}
+library(readxl)
+library(dplyr)
+# 读取两个表
+df_cog <- read_excel("D:/Works/ohmymymy/vMRI/cognition/rzgnsc_total_filtered_标注并填补_pureAD.xlsx")
+df_sus <- read_excel("/Users/qiuyuyue/Documents/MRI/data/SuStaIn/Output5/SuStaIn_results_correct_with_AOO_CSVD.csv")
+# 确保 ID 是字符型
+df_cog$ID <- as.character(df_cog$ID)
+df_sus$ID <- as.character(df_sus$ID)
+# ✅ 先在 df_cog 中选择你关注的列
+df_cog_selected <- df_cog %>%
+  select(ID, MMSE_date, 间隔天数, MMSE, MOCA, ADL)
+# ✅ 合并：将分型信息添加到每条认知记录上
+df_long <- df_cog_selected %>%
+  left_join(df_sus, by = "ID")
+
+library(openxlsx)
+write.xlsx(
+  df_long, file = "D:/Works/ohmymymy/vMRI/sustaln_biomarker/sustaln_output/pureAD_最终版2_MCMC100000/vMRI_with_SuStaIn_S3to5_历次MMSE.xlsx"
+)
+```
+
+# 数据读取和清理
+```{r}
+rm(list = ls())
+library(readxl)
+library(dplyr)
+df <- read.csv("/Users/qiuyuyue/Documents/MRI/data/SuStaIn/原sustain_result_历次MMSE_FINAL_MERGED.csv")
+df$ID <- as.character(df$ID)
+df$ml_subtype <- as.factor(df$ml_subtype)
+
+# 转换间隔天数为月（约为 30.44 天一月）
+df$interval_months <- df$`间隔天数` / 30.44
+df$interval_years <- df$`间隔天数` / 365
+
+#筛选MMSE≥2次的参与者
+library(dplyr)
+df_mmse_valid <- df %>% filter(!is.na(MMSE))
+# 统计每个 ID 有效 MMSE 次数
+mmse_counts <- df_mmse_valid %>%
+  group_by(ID) %>%
+  summarise(n_mmse = n())
+# 筛选出 ≥2 次 MMSE 的 ID
+valid_mmse_ids <- mmse_counts %>%
+  filter(n_mmse >= 2) %>%
+  pull(ID)
+# 创建用于模型的 df_mmse
+df_mmse <- df %>%
+  filter(ID %in% valid_mmse_ids & !is.na(MMSE))
+
+#筛选ADL>2次的参与者
+df_adl_valid <- df %>% filter(!is.na(ADL))
+# 统计每个 ID 有效 ADL 次数
+adl_counts <- df_adl_valid %>%
+  group_by(ID) %>%
+  summarise(n_adl = n())
+# 筛选出 ≥2 次 ADL 的 ID
+valid_adl_ids <- adl_counts %>%
+  filter(n_adl >= 2) %>%
+  pull(ID)
+# 创建用于模型的 df_adl
+df_adl <- df %>%
+  filter(ID %in% valid_adl_ids & !is.na(ADL))
+
+
+n_mmse_patients <- mmse_counts %>% filter(n_mmse >= 2) %>% nrow()
+cat("Number of patients with ≥2 MMSE assessments:", n_mmse_patients, "\n")
+n_adl_patients <- adl_counts %>% filter(n_adl >= 2) %>% nrow()
+cat("Number of patients with ≥2 ADL assessments:", n_adl_patients, "\n")
+sum(!is.na(df_mmse$MMSE))
+sum(!is.na(df_adl$ADL))
+
+
+```
+# 混合效应模型
+```{r}
+library(lme4)
+library(lmerTest)
+# 模型：MMSE ~ 时间 + 分型 + 时间×分型 + 随机个体效应
+model_mmse <- lmer(MMSE ~ interval_years * ml_subtype + age + edu_year + sex + ml_stage + (1 | ID), data = df_mmse)
+summary(model_mmse)
+library(emmeans)
+emm_mmse <- emtrends(model_mmse, ~ ml_subtype, var="interval_years")
+pairs(emm_mmse)
+
+model_mmse0 <- lmer(MMSE ~ interval_years + ml_subtype + age + edu_year + sex + ml_stage + (1 | ID), data = df_mmse)
+model_mmse1 <- lmer(MMSE ~ interval_years * ml_subtype + age + edu_year + sex + ml_stage + (1 | ID), data = df_mmse)
+anova(model_mmse0, model_mmse1)
+
+# 模型：ADL ~ 时间 + 分型 + 时间×分型 + 随机个体效应
+model_adl <- lmer(ADL ~ interval_years * ml_subtype + age + edu_year + sex + ml_stage + (1 | ID), data = df_adl)
+summary(model_adl)
+emm_adl <- emtrends(model_adl, ~ ml_subtype, var="interval_years")
+pairs(emm_adl)
+
+model_adl0 <- lmer(ADL ~ interval_years + ml_subtype + age + edu_year + sex + ml_stage + (1 | ID), data = df_adl)
+model_adl1 <- lmer(ADL ~ interval_years * ml_subtype + age + edu_year + sex + ml_stage + (1 | ID), data = df_adl)
+anova(model_adl0, model_adl1)
+```
+
+# 检查残差的正态性和方差齐性
+```{r}
+plot(model_mmse)
+plot(model_adl)
+```
+
+
+
+# 不同subtype的mmse下降速率
+```{r}
+library(emmeans)
+# --- 第一步：计算并显示每个 ml_subtype 的 MMSE 下降速度（斜率） ---
+
+# emtrends(模型对象, ~ 分组变量, var = "斜率变量")
+# 计算每个 ml_subtype 水平上，MMSE 随 interval_years 变化的估计斜率
+mmse_slopes <- emtrends(
+    object = model_mmse,
+    specs = ~ ml_subtype,
+    var = "interval_years"
+)
+
+# 打印估计的斜率结果 (Estimate)，这将给出每个分型的实际下降速度
+# 例如：ml_subtype1 的速度 = -2.21720
+# ml_subtype2 的速度 = -2.21720 + (-0.67275) = -2.88995
+cat("\n--- 1. 各分型 MMSE 下降速度 (斜率) 估计值 ---\n")
+print(mmse_slopes)
+
+
+# --- 第二步：对不同分型之间的下降速度进行两两比较 ---
+
+# 使用 pairs() 函数进行两两比较，检验下降速度是否存在显著差异
+slope_comparisons <- pairs(mmse_slopes)
+cat("\n--- 2. 不同分型之间下降速度的两两比较结果 ---\n")
+print(slope_comparisons)
+
+# --- 结果解读指南 ---
+# 1. **mmse_slopes** 的输出：
+#    - 'estimate' 列是每个分型实际的 MMSE 下降速率（单位：分/年）。
+#    - 'SE' 和 'df' 是对应的标准误和自由度。
+# 2. **slope_comparisons** 的输出：
+#    - 'estimate' 列是两个分型下降速率之差。
+#    - 'p.value' 列是检验该差异是否显著的 P 值。
+```
+
+
+# 可视化
+```{r}
+library(ggplot2)
+library(lme4)
+library(sjPlot)
+library(ggeffects)
+library(ggsci)
+
+ggplot(df_mmse, aes(x = interval_years, y = MMSE, color = as.factor(ml_subtype))) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.2) +
+  scale_color_jama(name = "SuStaIn Subtype") +  # 使用JAMA配色
+  labs(
+    x = "Years from MRI (positive = after MRI)",
+    y = "MMSE Score"
+  ) +
+  annotate("text", x = Inf, y = Inf, label = "Subtype 2 vs 4: p = 0.02", 
+           hjust = 1.05, vjust = 1.7, size = 4.5, fontface = "italic") +
+  theme_minimal(base_size = 14)
+ggplot(df_adl, aes(x = interval_years, y = ADL, color = as.factor(ml_subtype))) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_color_jama(name = "SuStaIn Subtype") +  # 使用JAMA配色
+  labs(
+    x = "Years from MRI (positive = after MRI)",
+    y = "ADL Score",
+    color = "SuStaIn Subtype"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+
+```{r}
+library(ggplot2)
+library(lme4)
+library(sjPlot)
+library(ggeffects)
+library(ggsci)
+
+# 第一个图：MMSE Score
+mmse_plot <-ggplot(df_mmse, aes(x = interval_years, y = MMSE, 
+                    color = as.factor(ml_subtype), 
+                    fill = as.factor(ml_subtype))) + # <-- **关键修改：添加 fill 映射**
+  geom_smooth(method = "lm", linewidth = 0.9, alpha = 0.2) + # <-- 调整 alpha 让阴影透明
+  scale_color_jama(name = "Subtype") + 
+  scale_fill_jama(name = "Subtype") + # <-- **关键修改：添加 scale_fill_jama 确保颜色一致**
+  labs(
+    x = "Years from MRI (positive = after MRI)",
+    y = "MMSE Score"
+  ) +
+  annotate("text", x = Inf, y = Inf, label = "Subtype 2 vs 4: p = 0.02*", 
+           hjust = 1.05, vjust = 1.7, size = 4.5, fontface = "italic") +
+  theme_minimal(base_size = 14)
+
+# 第二个图：ADL Score
+adl_plot <-ggplot(df_adl, aes(x = interval_years, y = ADL, 
+                    color = as.factor(ml_subtype),
+                    fill = as.factor(ml_subtype))) + # <-- **关键修改：添加 fill 映射**
+  geom_smooth(method = "lm", linewidth = 0.9, alpha = 0.2) + # <-- 调整 alpha 让阴影透明
+  scale_color_jama(name = "Subtype") + 
+  scale_fill_jama(name = "Subtype") + # <-- **关键修改：添加 scale_fill_jama 确保颜色一致**
+  labs(
+    x = "Years from MRI (positive = after MRI)",
+    y = "ADL Score",
+    color = "Subtype"
+  ) +
+  theme_minimal(base_size = 14)
+
+# 保存图
+save_dir <- "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/"
+ggsave(
+  filename = "MMSE_Trend.pdf",
+  plot = mmse_plot,
+  path = save_dir,
+  device = "pdf",
+  width = 7, 
+  height = 5
+)
+ggsave(
+  filename = "ADL_Trend.pdf",
+  plot = adl_plot,
+  path = save_dir,
+  device = "pdf",
+  width = 7, 
+  height = 5
+)
+cat("MMSE 趋势图已保存到:", file.path(save_dir, "MMSE_Trend.pdf"), "\n")
+cat("ADL 趋势图已保存到:", file.path(save_dir, "ADL_Trend.pdf"), "\n")
+
+
+```
+
+### LLM可视化
+```{r}
+library(ggeffects)
+library(ggplot2)
+library(ggsci)
+# --- 函数封装：通用 LMM 绘图函数 (简洁版) ---
+plot_lmm_trend <- function(model, raw_data, y_lab, p_label = "") {
+  
+  # 1. 提取模型预测值 (Marginal Effects)
+  # terms = c("interval_years", "ml_subtype") 表示我们要看时间 x 亚型的交互
+  pred_dat <- ggpredict(model, terms = c("interval_years", "ml_subtype"))
+  
+  # 2. 绘图
+  ggplot() +
+    # (A) 底层：画原始数据的散点 (浅色、透明)，展示真实分布
+    geom_jitter(data = raw_data, 
+                aes(x = interval_years, y = .data[[as.character(formula(model)[2])]], # 自动获取 Y 变量名
+                    color = as.factor(ml_subtype)),
+                alpha = 0.15, size = 0.8, width = 0.2) +
+    # (B) 顶层：画模型预测的拟合线 (Ribbon是置信区间)
+    geom_ribbon(data = pred_dat, 
+                aes(x = x, ymin = conf.low, ymax = conf.high, fill = group), 
+                alpha = 0.2) +
+    geom_line(data = pred_dat, 
+              aes(x = x, y = predicted, color = group), 
+              linewidth = 1) +
+    
+    # (C) 标注 P 值 (如果提供了的话)
+    annotate("text", x = -Inf, y = Inf, label = p_label, 
+             hjust = -0.1, vjust = 1.5, size = 4, fontface = "italic") +
+    
+    # (D) 美化
+    scale_color_jama(name = "Subtype") +
+    scale_fill_jama(name = "Subtype") +
+    labs(x = "Years from Baseline MRI", y = y_lab) +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "top")
+}
+
+# --- 3. 调用函数画图 ---
+
+# 画 MMSE (带 P 值标注)
+p_mmse_final <- plot_lmm_trend(model_mmse, df_mmse, "MMSE Score", "Subtype 2 vs 4 slope: p = 0.02")
+
+# 画 ADL
+p_adl_final <- plot_lmm_trend(model_adl, df_adl, "ADL Score", "No significant slope difference")
+
+# --- 4. 保存 ---
+save_dir <- "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/"
+# ggsave("MMSE_LMM_Trend.pdf", p_mmse_final, path = save_dir, width = 6, height = 5)
+# ggsave("ADL_LMM_Trend.pdf", p_adl_final, path = save_dir, width = 6, height = 5)
+
+# 查看效果
+print(p_mmse_final)
+print(p_adl_final)
+
+```
+
+
+
+# 左右拼接
+
+```{r}
+library(patchwork)
+library(ggplot2) # 确保已加载 ggplot2，如果 mmse_plot 和 adl_plot 是用 ggplot2 创建的
+
+# 1. 构建拼接图
+# 使用 `|` 符号进行左右拼接
+# 使用 `&` 符号统一主题设置（隐藏左图图例，并在右侧收集所有图例）
+combined_plot <- (mmse_plot + theme(legend.position = "none")) | 
+                 (adl_plot) 
+
+# 2. 收集图例并设置全局图例位置
+# 使用 `& theme(legend.position = 'right')` 收集图例到右侧，但这在 | 拼接中可能会更复杂
+# 更简洁的方式是使用 plot_layout(guides = "collect") 然后设置 plot_annotation
+combined_plot <- combined_plot + 
+                 plot_layout(guides = "collect") & 
+                 theme(legend.position = 'right')
+
+# 3. 添加 (A) 和 (B) 标签
+# 使用 plot_annotation 来添加整体标题、副标题，以及最重要的：
+# tag_levels = 'A' 会自动为每个子图（由 | 或 / 分隔）按 A, B, C... 编号
+combined_plot <- combined_plot + 
+                 plot_annotation(tag_levels = 'A')
+
+# 打印最终图
+print(combined_plot)
+
+# 4. 保存图片
+save_dir <- "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/"
+ggsave(
+  filename = "MMSE_ADL_Trend.pdf",
+  plot = combined_plot,
+  path = save_dir,
+  device = "pdf",
+  width = 12, 
+  height = 5
+)
+ggsave(
+  filename = "MMSE_ADL_Trend.tiff", # 修改文件名后缀
+  plot = combined_plot,
+  path = save_dir,
+  device = "tiff",                    # 指定设备为 tiff
+  width = 12, 
+  height = 5,
+  dpi = 300,
+  compression = "lzw", # 使用无损压缩，防止文件过大
+  bg = "white"
+)
+```
+
+

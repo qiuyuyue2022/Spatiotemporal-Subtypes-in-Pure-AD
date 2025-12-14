@@ -1,0 +1,473 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# 加载包
+```{r}
+rm(list = ls())
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(openxlsx)
+library(tidyr)
+library(ggpubr)
+library(rstatix)
+library(tibble)
+options(scipen = 999)
+```
+
+# 读取表和变量
+```{r}
+# 读取表
+df <- read.csv("/Users/qiuyuyue/Documents/MRI/data/SuStaIn/原sustain_result_FINAL_MERGED.csv") %>%
+  mutate(ID = as.character(ID), 
+         mri_date = as.Date(mri_date))
+df <- df %>%
+  mutate(
+    # 如果 AOO 列为 NA，则使用 age 列的值填充；
+    # 如果 AOO 不为 NA，则保留 AOO 原始值。
+    AOO = coalesce(AOO, age)
+  )
+
+df <- df[df$ml_subtype != 0, ]
+df$ml_subtype <- as.factor(df$ml_subtype)
+
+df$age <- gsub("Y", "", df$age)
+df$age <- as.numeric(df$age)
+df$apoe4 <- as.numeric(df$apoe4)
+df$apoe4_num <- as.numeric(df$apoe4_num)
+df$sex <- as.factor(df$sex)
+table(df$ml_subtype)
+shapiro.test(df$age)
+shapiro.test(df$AOO)
+shapiro.test(df$ml_stage)
+
+cont_vars <- c("age","AOO", "edu_year", "mmse", "adl")
+cat_vars <- c("sex", "apoe4")
+```
+
+# 计算每组样本量
+```{r}
+subtype_counts <- df %>%
+  count(ml_subtype) %>%
+  arrange(as.numeric(as.character(ml_subtype))) %>%
+  mutate(label = paste0("Subtype ", ml_subtype, "\n(n = ", n, ")"))
+subtype_counts
+```
+# 连续变量：中位数 [IQR]，转宽数据
+```{r}
+cont_summary <- df %>%
+  group_by(ml_subtype) %>%
+  summarise(across(all_of(cont_vars), list(
+    median = ~median(., na.rm = TRUE),
+    Q1 = ~quantile(., 0.25, na.rm = TRUE),
+    Q3 = ~quantile(., 0.75, na.rm = TRUE)
+  ), .names = "{.col}_{.fn}")) %>%
+  ungroup() %>%
+  mutate(across(ends_with("_median"), ~round(., 2)),
+         across(ends_with("_Q1"), ~round(., 2)),
+         across(ends_with("_Q3"), ~round(., 2))) %>%
+  mutate(
+    age      = paste0(age_median, " [", age_Q1, "-", age_Q3, "]"),
+    AOO      = paste0(AOO_median, " [", AOO_Q1, "-", AOO_Q3, "]"),
+    edu_year = paste0(edu_year_median, " [", edu_year_Q1, "-", edu_year_Q3, "]"),
+    MMSE     = paste0(mmse_median, " [", mmse_Q1, "-", mmse_Q3, "]"),
+    ADL      = paste0(adl_median, " [", adl_Q1, "-", adl_Q3, "]")
+  ) %>%
+  select(ml_subtype, age, AOO, edu_year, MMSE, ADL) %>%
+  pivot_longer(cols = -ml_subtype, names_to = "Variable", values_to = "Value") %>%
+  pivot_wider(names_from = ml_subtype, values_from = Value)
+cont_total_col <- df %>%
+  summarise(across(all_of(cont_vars), list(
+    median = ~median(., na.rm = TRUE),
+    Q1 = ~quantile(., 0.25, na.rm = TRUE),
+    Q3 = ~quantile(., 0.75, na.rm = TRUE)
+  ), .names = "{.col}_{.fn}")) %>%
+  mutate(across(ends_with("_median"), ~round(., 2)),
+         across(ends_with("_Q1"), ~round(., 2)),
+         across(ends_with("_Q3"), ~round(., 2))) %>%
+  mutate(
+    age      = paste0(age_median, " [", age_Q1, "-", age_Q3, "]"),
+    AOO      = paste0(AOO_median, " [", AOO_Q1, "-", AOO_Q3, "]"),
+    edu_year = paste0(edu_year_median, " [", edu_year_Q1, "-", edu_year_Q3, "]"),
+    MMSE     = paste0(mmse_median, " [", mmse_Q1, "-", mmse_Q3, "]"),
+    ADL      = paste0(adl_median, " [", adl_Q1, "-", adl_Q3, "]")
+  ) %>%
+  select(age, AOO, edu_year, MMSE, ADL) %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Total")
+cont_summary
+```
+# 分类变量
+```{r}
+sex_summary <- df %>%
+  group_by(ml_subtype, sex) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(ml_subtype) %>%
+  mutate(percent = round(100 * n / sum(n), 1)) %>%
+  mutate(sex_label = ifelse(sex == "0", "Female", "Male"),
+         val = paste0(n, " (", percent, "%)")) %>%
+  filter(sex == "0") %>%  # 只保留 Female 行
+  select(ml_subtype, sex_label, val) %>%
+  pivot_wider(names_from = ml_subtype, values_from = val) %>%
+  rename(Variable = sex_label)
+sex_total_col <- df %>%
+  group_by(sex) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(percent = round(100 * n / sum(n), 1)) %>%
+  mutate(sex_label = ifelse(sex == "0", "Female", "Male"),
+         Total = paste0(n, " (", percent, "%)")) %>%
+  filter(sex == "0") %>%
+  select(sex_label, Total) %>%
+  rename(Variable = sex_label)
+# 处理 APOE ε4 carrier / non-carrier
+apoe_summary <- df %>%
+  filter(!is.na(apoe4)) %>%  # 去除 NA 行，保证分母准确
+  group_by(ml_subtype, apoe4) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(apoe4 = as.character(apoe4)) %>%
+  mutate(carrier_status = case_when(
+    apoe4 == "1" ~ "carrier",
+    apoe4 == "0" ~ "non-carrier"
+  )) %>%
+  select(ml_subtype, carrier_status, n) %>%
+  pivot_wider(names_from = carrier_status, values_from = n, values_fill = 0) %>%
+  mutate(val = paste0(carrier, " / ", `non-carrier`)) %>%
+  select(ml_subtype, val) %>%
+  pivot_wider(names_from = ml_subtype, values_from = val) %>%
+  mutate(Variable = "APOE ε4 carrier / non-carrier") %>%
+  select(Variable, everything())
+apoe_total_col <- df %>%
+  filter(!is.na(apoe4)) %>%
+  group_by(apoe4) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(apoe4 = as.character(apoe4)) %>%
+  mutate(carrier_status = case_when(
+    apoe4 == "1" ~ "carrier",
+    apoe4 == "0" ~ "non-carrier"
+  )) %>%
+  select(carrier_status, n) %>%
+  pivot_wider(names_from = carrier_status, values_from = n, values_fill = 0) %>%
+  mutate(Total = paste0(carrier, " / ", `non-carrier`),
+         Variable = "APOE ε4 carrier / non-carrier") %>%
+  select(Variable, Total)
+# 4. 合并连续和分类变量
+# 合并 Subtype 1-4 的 summary
+summary_final_orig <- bind_rows(cont_summary, sex_summary, apoe_summary)
+# 合并 Total 列
+total_summary_col <- bind_rows(cont_total_col, sex_total_col, apoe_total_col)
+
+# 整合 Total 列到 summary_final_orig
+summary_final <- summary_final_orig %>%
+  left_join(total_summary_col, by = "Variable") %>%
+  # 将 Total 列移动到 Subtype 列之前
+  relocate(Total, .after = Variable)
+summary_final
+```
+
+
+# 修改表格格式
+```{r}
+total_n <- sum(subtype_counts$n)
+colnames(summary_final) <- c(
+  "Variable",
+  paste0("Total (n = ", total_n, ")"), # Total 列的标题
+  subtype_counts$label
+)
+
+desired_order <- c(
+  "age",
+  "AOO",
+  "Female",
+  "edu_year",
+  "APOE ε4 carrier / non-carrier",
+  "MMSE",
+  "ADL"
+)
+
+summary_final <- summary_final %>%
+  mutate(Variable = factor(Variable, levels = desired_order)) %>%
+  arrange(Variable)
+
+summary_final
+```
+
+# p值
+```{r}
+# 1. Kruskal-Wallis：不做校正
+kw_results <- df %>%
+  select(ml_subtype, age, AOO, edu_year, mmse, adl) %>%
+  pivot_longer(cols = -ml_subtype, names_to = "Variable", values_to = "Value") %>%
+  group_by(Variable) %>%
+  summarise(
+    Statistic = kruskal.test(Value ~ ml_subtype)$statistic,
+    P_value = kruskal.test(Value ~ ml_subtype)$p.value
+  )
+
+# 2. 性别卡方：不做校正
+tbl_sex <- table(df$sex, df$ml_subtype)
+chi_sex <- chisq.test(tbl_sex)
+fisher_sex <- fisher.test(tbl_sex)
+sex_result <- data.frame(
+  Variable = "sex",
+  P_value = chi_sex$p.value
+)
+
+# 2. apoe4卡方：不做校正
+tbl_apoe4 <- table(df$apoe4, df$ml_subtype)
+chi_apoe4 <- chisq.test(tbl_apoe4)
+fisher_apoe4 <- fisher.test(tbl_apoe4)
+apoe4_result <- data.frame(
+  Variable = "apoe4",
+  P_value = chi_apoe4$p.value
+)
+
+# 3. 合并后统一 FDR 校正
+all_results <- bind_rows(kw_results, sex_result, apoe4_result) %>%
+  mutate(FDR_P = p.adjust(P_value, method = "fdr"))
+
+# 4. 输出结果
+all_results_formatted <- all_results %>%
+  slice(match(c("age", "AOO", "sex", "edu_year", "apoe4", "mmse", "adl"), Variable))  %>%
+  mutate(
+    P_value = round(P_value, 4),
+    FDR_P   = round(FDR_P, 4),
+    Statistic = round(Statistic, 2)  # 如果你想控制统计量保留两位
+  )
+
+print(all_results_formatted)
+```
+
+# Dunn组间比较
+```{r}
+# 定义一个函数，接受数据、因变量名称和分组变量名称
+perform_dunn_summary <- function(data, dependent_var, group_var = "ml_subtype") {
+  
+  # 1️⃣ 计算 Dunn 检验 + FDR
+  dunn_result <- data %>%
+    rstatix::dunn_test(as.formula(paste(dependent_var, "~", group_var)), p.adjust.method = "fdr") %>%
+    mutate(
+      group1 = as.character(group1),
+      group2 = as.character(group2)
+    )
+  
+  # 2️⃣ 计算各组中位数和 IQR
+  summary_result <- data %>%
+    group_by(!!sym(group_var)) %>%
+    summarise(
+      median_val = median(!!sym(dependent_var), na.rm = TRUE),
+      Q1 = quantile(!!sym(dependent_var), 0.25, na.rm = TRUE),
+      Q3 = quantile(!!sym(dependent_var), 0.75, na.rm = TRUE),
+      IQR_str = paste0("[", round(Q1, 1), "–", round(Q3, 1), "]"),
+      .groups = "drop"
+    )
+  
+  # 3️⃣ 合并 Dunn 结果和中位数/IQR
+  final_result <- dunn_result %>%
+    left_join(summary_result, by = c("group1" = group_var)) %>%
+    rename(group1_median = median_val, group1_IQR = IQR_str) %>%
+    left_join(summary_result, by = c("group2" = group_var)) %>%
+    rename(group2_median = median_val, group2_IQR = IQR_str) %>%
+    select(.y., group1, group2, n1, n2,
+           group1_median, group1_IQR,
+           group2_median, group2_IQR,
+           p, p.adj, p.adj.signif)
+  
+  return(final_result)
+}
+
+# 应用函数
+age_dunn_final <- perform_dunn_summary(df, "age")
+AOO_dunn_final <- perform_dunn_summary(df, "AOO")
+
+age_dunn_final
+AOO_dunn_final
+```
+
+# 可视化
+```{r}
+library(ggpubr)
+library(dplyr)
+library(Cairo)
+
+# 1. Age 箱线图 (实心填充 + 润色)
+plot_age <- ggboxplot(df, x = "ml_subtype", y = "age",
+                      fill = "ml_subtype",      # 👈 修改这里：用 fill 填充颜色
+                      palette = "jama",         # 使用 jama 配色
+                      alpha = 0.8,              # 👈 0.8 不透明度，看起来更有质感
+                      add = "jitter",           # 添加散点
+                      add.params = list(size = 1.5, alpha = 0.6), # 调整散点大小和透明度
+                      outlier.shape = NA) +     # 👈 隐藏箱线图自带的离群点，避免与 jitter 重复
+  stat_compare_means(method = "kruskal.test", label.y = max(df$age, na.rm = TRUE) + 7,
+                     size = 3.5,                # 字体大小设置为 3.5
+                     fontface = "italic") +
+  stat_pvalue_manual(
+    age_dunn_final %>% filter(p.adj < 0.05) %>%
+      mutate(y.position = seq(max(df$age, na.rm = TRUE) + 1, by = 1, length.out = n())),
+    label = "p.adj.signif"
+  ) +
+  labs(x = "Subtype", y = "Age") +
+  theme(legend.position = "none")
+
+# 2. AOO 箱线图 (实心填充 + 润色)
+plot_AOO <- ggboxplot(df, x = "ml_subtype", y = "AOO",
+                      fill = "ml_subtype",      # 👈 修改这里：用 fill 填充颜色
+                      palette = "jama",
+                      alpha = 0.8,
+                      add = "jitter",
+                      add.params = list(size = 1.5, alpha = 0.6),
+                      outlier.shape = NA) +
+  stat_compare_means(method = "kruskal.test", label.y = max(df$AOO, na.rm = TRUE) + 7,
+                     size = 3.5,                # 字体大小设置为 3.5
+                     fontface = "italic") +
+  stat_pvalue_manual(
+    AOO_dunn_final %>% filter(p.adj < 0.05) %>%
+      mutate(y.position = seq(max(df$AOO, na.rm = TRUE) + 1, by = 1, length.out = n())),
+    label = "p.adj.signif"
+  ) +
+  labs(x = "Subtype", y = "AOO (Age of Onset)") +
+  theme(legend.position = "none")
+
+plot_apoe <- ggplot(df, aes(x = ml_subtype, fill = as.factor(apoe4_num))) +
+  geom_bar(position = "fill") +
+  scale_fill_brewer(palette = "Blues", name = expression("APOE"*epsilon*"4 count")) +
+  labs(x = "Subtype", y = "Proportion") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  theme_minimal() +
+  theme(legend.title = element_text(size = 10))
+
+# 3. 合并图形
+combined_plot <- ggarrange(plot_age, plot_AOO, plot_apoe, 
+          ncol = 3, nrow = 1,
+          labels = c("A", "B", "C"),
+          widths = c(1, 1, 1.3))
+
+# 使用 ggexport 保存图片为 PDF
+ggexport(
+  plot_age,
+  filename = "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/Age_Boxplot.pdf",
+  width = 3.5, # 调整宽度以适应单个图
+  height = 4 
+)
+
+ggexport(
+  plot_AOO,
+  filename = "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/AOO_Boxplot.pdf",
+  width = 3.5, # 调整宽度以适应单个图
+  height = 4
+)
+
+ggexport(
+  plot_apoe,
+  filename = "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/apoe_Boxplot.pdf",
+  width = 4.6, # 调整宽度以适应单个图
+  height = 4,
+  device = "cairo_pdf"
+)
+
+ggexport(
+  combined_plot, 
+  filename = "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/Age_AOO_Boxplot.pdf", 
+  width = 11.5,  # 图像宽度 (英寸)
+  height = 4,   # 图像高度 (英寸)
+  device = "cairo_pdf"
+)
+combined_plot
+```
+
+# 上下左右拼接
+```{r}
+# 确保 library(magick) 已经运行
+library(magick)
+
+# 1. 定义所有文件路径
+path_ABC <- "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/Age_AOO_Boxplot.pdf"
+path_D <- "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/diamond_plots_3d.pdf"
+path_E <- "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/MMSEandStage.pdf"
+
+# ----------------- 准备左侧列 (A+B+C 垂直堆叠 D) -----------------
+
+# 2. 读取并准备第一个 PDF (A+B+C图)
+img_ABC <- image_read_pdf(path_ABC, density = 300)
+img_ABC <- image_border(img_ABC, "white", "10x10") # 增加边框
+
+# 3. 读取并准备第二个 PDF (D图)
+img_D <- image_read_pdf(path_D, density = 300)
+img_D <- image_scale(img_D, "80%")
+
+# 4. 标注 "D"
+img_D_labeled <- image_annotate(img_D, "D",
+                                gravity = "northwest",
+                                size = 17,
+                                font = "sans",
+                                weight = 400,
+                                color = "black",
+                                location = "+30+30")
+
+# 5. 垂直拼接左侧列
+img_column_left <- image_append(c(img_ABC, img_D_labeled), stack = TRUE)
+full_height <- image_info(img_column_left)$height # 获取左侧列的总高度，作为右侧画布的基准高度
+
+# ----------------- 准备右侧列 (图 E: 缩放并居中) -----------------
+
+# 6. 读取并准备第三个 PDF (新图 E)
+img_E <- image_read_pdf(path_E, density = 300)
+img_E <- image_trim(img_E) # <--- 关键修改：裁剪 PDF 固有的多余白边 (减小间距)
+img_E <- image_border(img_E, "white", "10x10") # 增加边框
+
+# 7. 标注 "E"
+img_E_labeled <- image_annotate(img_E, "E",
+                                gravity = "northwest",
+                                size = 14.5,
+                                font = "sans",
+                                weight = 400,
+                                color = "black",
+                                location = "+10+5")
+
+# 8. 调整图 E 的大小
+scale_factor_E <- 0.80
+target_E_height <- full_height * scale_factor_E
+img_E_scaled <- image_scale(img_E_labeled, paste0("x", target_E_height))
+E_current_width <- image_info(img_E_scaled)$width
+E_current_height <- image_info(img_E_scaled)$height
+
+# 9. 垂直居中图 E **并向上微调 (使用 image_composite 修复)**
+# 9a. 计算居中点和偏移量
+# 严格居中的 Y 坐标起点 (距离顶部)
+center_y_start <- (full_height - E_current_height) / 2
+
+# 向上移动 30 像素 (负值表示向上，所以从起点减去 30)
+vertical_adjustment <- 40 # 向上移动 30 像素
+final_y_start <- center_y_start - vertical_adjustment
+
+# 9b. 创建一个等高宽度的空白画布
+# 宽度可以设置为 E_current_width，或者如果想让 E 所在列和左列宽度一致，可以使用 full_width_left
+# 这里我们使用 E_current_width 来保证图像紧凑
+canvas <- image_blank(width = E_current_width, height = full_height, color = "white")
+
+# 9c. 使用 image_composite 将 E 图精确叠加到画布上
+# offset 格式为 "+X+Y"，X 偏移为 0，Y 偏移为 final_y_start
+img_E_centered <- image_composite(
+    canvas,
+    img_E_scaled,
+    offset = paste0("+0+", round(final_y_start)) # Y 坐标使用计算出的精确值
+)
+
+# ----------------- 最终水平拼接 (减小间距) -----------------
+
+# 10. 水平拼接左右两列
+combined_final_img <- image_append(c(img_column_left, img_E_centered))
+# 11. 保存最终结果
+image_write(combined_final_img, path = "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/Fig2_ABCDE.pdf", format = "pdf")
+image_write(
+  combined_final_img, 
+  path = "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/Fig2_ABCDE.tiff", 
+  format = "tiff", 
+  # dpi 在这里不能设置，它已经在 image_read 或 image_annotate 等操作时被对象继承
+  compression = "lzw" 
+)
+
+cat("最终合并的 PDF/TIFF（左侧 A+B+C+D 堆叠 | 右侧 缩放居中 E）已成功保存")
+```
+
+

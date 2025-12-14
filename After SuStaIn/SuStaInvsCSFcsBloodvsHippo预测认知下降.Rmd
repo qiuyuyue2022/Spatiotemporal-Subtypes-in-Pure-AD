@@ -1,0 +1,216 @@
+---
+title: "SuStaInvsCSFcsBloodvsHippo预测认知下降"
+output: html_notebook
+---
+
+# 数据预处理
+```{r}
+library(lme4)
+library(MuMIn)
+library(dplyr)
+library(readr)
+library(tidyr)
+
+df <- read_csv("/Users/qiuyuyue/Documents/MRI/data/SuStaIn/原sustain_result_历次MMSE_FINAL_MERGED.csv")
+
+# 统一变量名称（防出错）
+df <- df %>%
+  mutate(
+    time = 间隔天数 / 365,        # 年为单位
+    ttau_ab42 = lumi_tTau_42 / lumi_pTau_42
+  ) %>%
+  mutate(
+    ml_subtype = factor(ml_subtype),
+    sex = factor(sex)
+  )
+
+# 取所有模型的共同样本（complete cases）
+vars_needed <- c(
+  "MMSE", "time", "Hippo_Zcombined", 
+  "ml_subtype", "ml_stage",
+  "ptau217", "lumi_pTau_42",
+  "age", "sex", "edu_year"
+)
+df_cc <- df %>% 
+  select(all_of(vars_needed), ID) %>%
+  drop_na()
+
+#筛选MMSE≥2次的参与者
+df_mmse_valid <- df_cc %>% filter(!is.na(MMSE))
+# 统计每个 ID 有效 MMSE 次数
+mmse_counts <- df_mmse_valid %>%
+  group_by(ID) %>%
+  summarise(n_mmse = n())
+# 筛选出 ≥2 次 MMSE 的 ID
+valid_mmse_ids <- mmse_counts %>%
+  filter(n_mmse >= 2) %>%
+  pull(ID)
+# 创建用于模型的 df_mmse
+df_mmse <- df_cc %>%
+  filter(ID %in% valid_mmse_ids & !is.na(MMSE))
+n_subjects <- length(unique(df_mmse$ID))
+
+# 打印最终样本量信息
+cat("Complete cases sample size (Total Observations):", nrow(df_mmse), "\n")
+cat("Complete cases sample size (Unique Participants, N):", n_subjects, "\n")
+
+```
+
+# 模型
+```{r}
+library(lmerTest)
+## Model 1: SuStaIn
+model_sustain <- lmer(
+  MMSE ~ time * ml_subtype  + time * ml_stage +
+    age + sex + edu_year +
+    (1 | ID),
+  data = df_mmse,
+  REML = FALSE
+)
+
+## Model 2: CSF p-tau/Aβ42
+model_csf <- lmer(
+  MMSE ~ time * lumi_pTau_42 +
+    age + sex + edu_year +
+    (1 | ID),
+  data = df_mmse,
+  REML = FALSE
+)
+
+## Model 3: plasma p-tau217
+model_ptau <- lmer(
+  MMSE ~ time * ptau217 +
+    age + sex + edu_year +
+    (1 | ID),
+  data = df_mmse,
+  REML = FALSE
+)
+
+## Model 4: MRI hippocampus
+model_hippo <- lmer(
+  MMSE ~ time * Hippo_Zcombined  + 
+    age + sex + edu_year +
+    (1 | ID),
+  data = df_mmse,
+  REML = FALSE
+)
+
+```
+
+
+# 模型性能比较
+```{r}
+# AIC/BIC
+AIC(model_sustain, model_csf, model_ptau, model_hippo)
+BIC(model_sustain, model_csf, model_ptau, model_hippo)
+# R²
+r.squaredGLMM(model_sustain)
+r.squaredGLMM(model_csf)
+r.squaredGLMM(model_ptau)
+r.squaredGLMM(model_hippo)
+
+```
+
+
+# 输出关键交互项(预测下降的能力)
+```{r}
+options(scipen = 999)
+summary(model_sustain)$coefficients
+summary(model_csf)$coefficients
+summary(model_ptau)$coefficients
+summary(model_hippo)$coefficients
+
+```
+
+# 确认正态性和同方差性假设是否大致满足
+```{r}
+plot(model_sustain)
+plot(model_csf)
+plot(model_ptau)
+plot(model_hippo)
+```
+
+
+# 可视化
+```{r}
+library(Cairo)
+library(ggplot2)
+library(dplyr)
+library(MuMIn) 
+
+# 1. 自动提取 R2m 指标
+model_list <- list(model_sustain, model_csf, model_ptau, model_hippo)
+model_names <- c(
+  "SuStaIn",
+  "CSF p-tau181/Aβ42", 
+  "Plasma p-tau217",
+  "Hippocampus Volume"
+)
+
+r2m_values <- sapply(model_list, function(x) r.squaredGLMM(x)[1, "R2m"])
+
+plot_data_r2m <- data.frame(
+  Model = factor(model_names, levels = model_names),
+  R2m = r2m_values
+)
+
+# 2. 绘制横向 R2m 柱状图
+p_r2m_horizontal <- ggplot(plot_data_r2m, aes(x = Model, y = R2m, fill = Model)) +
+  geom_bar(stat = "identity", width = 0.7, color = "black", linewidth = 0.3) +
+  
+  # 关键步骤：转换为横向图
+  coord_flip() + 
+  geom_text(aes(label = sprintf("%.3f", R2m)), 
+            hjust = -0.15, size = 5, fontface = "bold") +
+  
+  # 突出最高R2m (SuStaIn)
+  scale_fill_manual(values = c("#E64B35", "#4DBBD5", "#00A087", "#3C5488")) + 
+  
+  # 设置 X 轴（即R2m值轴）范围和标签
+  scale_y_continuous(limits = c(0, max(plot_data_r2m$R2m) * 1.2), # 增大X轴限制给标签留空间
+                     name = expression(bold(Marginal~R^2~(R[m]^2)))) +
+  
+  # 设置 Y 轴（即Model名称轴）顺序，让 SuStaIn 在最上方
+  scale_x_discrete(limits = rev(levels(plot_data_r2m$Model))) + 
+  
+  # 主题设置
+  theme_classic(base_size = 14) +
+  labs(title = NULL, x = NULL) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    # 横向后，Model名称在Y轴，不需要旋转
+    axis.text.y = element_text(color = "black", face = "bold"),
+    axis.text.x = element_text(color = "black"), # X轴是数值
+    panel.grid.major.x = element_line(color = "grey90", linetype = "dashed") # 增加水平辅助线
+  )
+
+# 显示图片
+print(p_r2m_horizontal)
+
+ggsave(
+  filename = "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/Variance_Explained_by_Fixed_Effects.pdf",
+  plot = p_r2m_horizontal,
+  device = cairo_pdf,  # 关键点：使用 cairo_pdf 引擎来支持特殊字符
+  width = 7,
+  height = 4,
+  units = "in"
+)
+
+ggsave(
+  filename = "/Users/qiuyuyue/Documents/MyPapers/sustain/Fig/Variance_Explained_by_Fixed_Effects.tiff",
+  plot = p_r2m_horizontal, 
+  device = "tiff",
+  width = 7, 
+  height = 4,
+  units = "in",
+  dpi = 600 # 必须确保分辨率在 300-600 DPI，符合期刊要求
+)
+
+# Figure Caption Draft
+# Figure X. Comparison of Marginal R2 across prognostic models for MMSE decline.
+# Marginal R2 (Rm2) quantifies the proportion of variance in longitudinal MMSE scores explained by the fixed effects (biomarker interaction with time, age, sex, and education). 
+# The SuStaIn model, which incorporates both subtype and disease stage, achieved the highest Rm2 (0.55), demonstrating substantially greater prognostic power and fit compared to single-marker models: CSF p-tau/Aβ (Rm2=0.34), plasma p-tau217 (Rm2=0.30), and hippocampal volume Z-score (Rm2=0.28). This suggests that the model capturing multimodal progression patterns explains more heterogeneity in cognitive decline than fluid biomarker indices.
+
+```
+
